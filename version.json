@@ -1,4 +1,4 @@
 {
-  "version": "1.0.3",
-  "changelog": "Menu 13 fixes downloads not showing in Gallery (termux-api media scan)"
+  "version": "1.0.4",
+  "changelog": "Gallery fix without any extra app (menu 13 scans and checks your newest file)"
 }
