@@ -1,4 +1,4 @@
 {
-  "version": "1.1.0",
-  "changelog": "New web interface (menu 14 or: python mediadl.py web) - all downloads from your browser, still one file"
+  "version": "1.2.0",
+  "changelog": "Web interface redesigned: glass control-center tiles that expand into a single window"
 }
