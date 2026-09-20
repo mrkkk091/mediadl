@@ -14,7 +14,7 @@ from collections import deque
 from importlib import invalidate_caches
 from importlib.util import find_spec
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 UPDATE_REPO = "https://github.com/mrkkk091/mediadl"
 
 CONFIG_PATH = os.path.expanduser("~/.mediadl.json")
@@ -207,11 +207,24 @@ def cleanup_orphans(folder, before):
                 pass
 
 
+_gallery_tip_shown = False
+
+
 def media_scan(path):
+    global _gallery_tip_shown
     tool = shutil.which("termux-media-scan")
     if tool and os.path.exists(path):
-        subprocess.run([tool, "-r", path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            r = subprocess.run([tool, "-r", path], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30)
+            if r.returncode == 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not _gallery_tip_shown:
+        _gallery_tip_shown = True
+        say("Tip: if files don't show in Gallery / Music app, use menu option 13.", "y")
+    return False
 
 
 def platform_of(url):
@@ -230,7 +243,7 @@ PLATFORM_DIR = {"tiktok": "TikTok", "instagram": "Instagram",
 
 IS_TERMUX = bool(shutil.which("pkg")) and os.path.isdir("/data/data/com.termux")
 STALE_DAYS = 30
-ICONS = {"ok": ("✔", "g"), "bad": ("✖", "r"), "warn": ("⚠", "y")}
+ICONS = {"ok": ("✔", "g"), "bad": ("✖", "r"), "warn": ("⚠", "y"), "tip": ("ℹ", "c")}
 
 
 def _pip_version(name):
@@ -307,6 +320,9 @@ def scan_requirements():
         report.append(("ok", "Node.js"))
 
     if IS_TERMUX:
+        if not shutil.which("termux-media-scan"):
+            report.append(("tip", "Gallery refresh not set up - downloads may not show "
+                                  "in Gallery (menu option 13)"))
         if os.access("/storage/emulated/0", os.W_OK):
             report.append(("ok", "Storage permission"))
         else:
@@ -838,6 +854,33 @@ def music_link(url):
     return music_ytdlp(url)
 
 
+def menu_gallery_fix():
+    say("\n== Fix: show downloads in Gallery / Music app ==")
+    say("Android only lists new files after a media scan. That command comes from "
+        "the 'termux-api' package (not termux-tools) and needs the Termux:API app.", "y")
+    if IS_TERMUX and not shutil.which("termux-media-scan"):
+        say("\nInstalling package termux-api...", "b")
+        subprocess.call(["pkg", "install", "-y", "termux-api"],
+                        env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+    if not shutil.which("termux-media-scan"):
+        say("The termux-api package is not installed, so scanning is not possible.", "r")
+        return
+    say("\nNow install the 'Termux:API' app from the same place you got Termux "
+        "(F-Droid or GitHub) and open it once.", "y")
+    ask("Press Enter to scan your folders...")
+    ok = True
+    for folder in (cfg["music_dir"], cfg["video_dir"]):
+        if os.path.isdir(folder):
+            say(f"Scanning {folder} ...", "c")
+            ok = media_scan(folder) and ok
+    if ok:
+        say("\n✔ Done. Open your Gallery. If videos are still missing, close "
+            "and reopen the Gallery app.", "g")
+    else:
+        say("\n✖ Scan failed. Check that the Termux:API app is installed (same "
+            "source as Termux) and was opened once, then try again.", "r")
+
+
 def menu_search():
     say("\n== Search & download song by name ==")
     q = ask("Song name (e.g. Rick Astley Never Gonna Give You Up):")
@@ -1214,6 +1257,7 @@ MENU = [
     ("10", "Check for script update", menu_script_update),
     ("11", "Check / install requirements", menu_requirements),
     ("12", "Search & download song by name", menu_search),
+    ("13", "Fix Gallery (show downloads in Gallery)", menu_gallery_fix),
 ]
 
 
