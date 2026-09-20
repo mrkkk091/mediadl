@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 import datetime
+import hmac
+import http.server
 import importlib.metadata as md
 import json
 import os
 import re
+import secrets
 import select
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -21,7 +25,7 @@ try:
 except ImportError:
     termios = None
 
-__version__ = "1.0.5"
+__version__ = "1.1.0"
 UPDATE_REPO = "https://github.com/mrkkk091/mediadl"
 
 CONFIG_PATH = os.path.expanduser("~/.mediadl.json")
@@ -69,11 +73,41 @@ COL = {"g": "\033[92m", "r": "\033[91m", "y": "\033[93m",
        "c": "\033[96m", "b": "\033[1m", "0": "\033[0m"}
 
 
+_ctx = threading.local()
+JOB_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class JobCancelled(Exception):
+    pass
+
+
+def current_job():
+    return getattr(_ctx, "job", None)
+
+
+def check_cancel():
+    job = current_job()
+    if job is not None and job.cancel.is_set():
+        raise JobCancelled()
+
+
+def set_progress(value, force=False):
+    job = current_job()
+    if job is None or (job.opts.get("batch") and not force):
+        return
+    job.progress = None if value is None else max(0.0, min(100.0, float(value)))
+
+
 def say(msg, col="c"):
     print(f"{COL[col]}{msg}{COL['0']}")
 
 
 def ask(prompt, default=""):
+    job = current_job()
+    if job is not None:
+        if "whole playlist" in prompt:
+            return "2" if job.opts.get("playlist") else "1"
+        return default
     try:
         v = input(f"{COL['y']}{prompt}{COL['0']} ").strip()
     except EOFError:
@@ -106,6 +140,8 @@ def clean_path(p):
 
 
 def run(cmd):
+    if current_job() is not None:
+        return run_captured(cmd)
     print()
     try:
         return subprocess.run(cmd).returncode == 0
@@ -127,7 +163,7 @@ class SkipTrack(Exception):
 
 
 def flush_stdin():
-    if termios and sys.stdin.isatty():
+    if current_job() is None and termios and sys.stdin.isatty():
         try:
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
         except (OSError, ValueError, termios.error):
@@ -135,7 +171,9 @@ def flush_stdin():
 
 
 def show_skip_hint():
-    if sys.stdin.isatty():
+    if current_job() is not None:
+        say("Use the Skip button to skip the current song.", "y")
+    elif sys.stdin.isatty():
         say("Press ENTER at any time to skip the current song.", "y")
 
 
@@ -177,30 +215,77 @@ def _kill(p):
         p.wait()
 
 
+_CANCEL = object()
+PROGRESS_RE = re.compile(r"\[download\]\s+([\d.]+)%")
+ITEM_RE = re.compile(r"\[(\d+)/(\d+)\]")
+
+
 def _read_lines(p, poll):
     fd = p.stdout.fileno()
     buf = b""
+    job = current_job()
+    use_tty = poll and job is None
     while True:
-        watch = [fd, sys.stdin] if poll else [fd]
+        if job is not None:
+            if job.cancel.is_set():
+                yield _CANCEL
+                return
+            if poll and job.skip.is_set():
+                job.skip.clear()
+                yield None
+        watch = [fd, sys.stdin] if use_tty else [fd]
         try:
             ready, _, _ = select.select(watch, [], [], 0.3)
         except (OSError, ValueError):
             ready = [fd]
-        if poll and sys.stdin in ready:
+        if use_tty and sys.stdin in ready:
             if sys.stdin.readline():
                 yield None
             else:
-                poll = False
+                use_tty = False
         if fd in ready:
             chunk = os.read(fd, 4096)
             if not chunk:
                 if buf:
                     yield buf.decode("utf-8", "replace")
                 return
-            buf += chunk
+            buf += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 yield line.decode("utf-8", "replace")
+
+
+def run_captured(cmd):
+    job = current_job()
+    if cmd[:len(YT_DLP)] == YT_DLP:
+        cmd = cmd[:len(YT_DLP)] + ["--newline"] + cmd[len(YT_DLP):]
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True,
+                             env=dict(os.environ, PYTHONUNBUFFERED="1"))
+    except FileNotFoundError:
+        say(f"Command not found: {cmd[0]}", "r")
+        return False
+    try:
+        for raw in _read_lines(p, True):
+            if raw is _CANCEL:
+                _kill(p)
+                raise JobCancelled()
+            if raw is None:
+                continue
+            line = raw.strip()
+            if not line:
+                continue
+            m = PROGRESS_RE.search(line)
+            if m:
+                set_progress(m.group(1))
+                continue
+            job.add_text(line + "\n")
+        p.wait()
+    except KeyboardInterrupt:
+        _kill(p)
+        raise
+    return p.returncode == 0
 
 
 def run_clean(cmd, seen, skippable=False):
@@ -211,21 +296,30 @@ def run_clean(cmd, seen, skippable=False):
     except FileNotFoundError:
         say(f"Command not found: {cmd[0]}", "r")
         return False, False
-    poll = skippable and sys.stdin.isatty()
+    poll = skippable and (current_job() is not None or sys.stdin.isatty())
     retryable = False
     current = ""
     try:
         for raw in _read_lines(p, poll):
+            if raw is _CANCEL:
+                _kill(p)
+                raise JobCancelled()
             if raw is None:
                 _kill(p)
                 raise SkipTrack(current)
             line = raw.strip()
             if line.startswith(NEXT_TAG):
                 current = line[len(NEXT_TAG):]
+                m = ITEM_RE.match(current)
+                if m:
+                    set_progress((int(m.group(1)) - 1) / int(m.group(2)) * 100)
                 if current not in seen:
                     say(f"  → Next: {current}", "c")
             elif line.startswith(DONE_TAG):
                 item = line[len(DONE_TAG):]
+                m = ITEM_RE.match(item)
+                if m:
+                    set_progress(int(m.group(1)) / int(m.group(2)) * 100)
                 if item not in seen:
                     seen.add(item)
                     say(f"  ✔ Done: {item}", "g")
@@ -919,6 +1013,10 @@ def search_and_download(query):
 
 
 def spotify_fallback(kind, sid):
+    if current_job() is not None:
+        say("Could not read this Spotify link. Try the Search tab to find the "
+            "song by name.", "y")
+        return False
     if kind != "track":
         say("Tip: paste this album's YouTube Music link in the music option, "
             "or search songs by name (option 12).", "y")
@@ -973,6 +1071,8 @@ def music_spotify(url):
         show_skip_hint()
     flush_stdin()
     for tr in tracks:
+        check_cancel()
+        set_progress((tr["n"] - 1) / total * 100)
         label = f"{tr['artist']} - {tr['title']}" if tr["artist"] else tr["title"]
         prefix = "" if single else f"[{tr['n']:02d}/{total}] "
         stem = f"{tr['n']:02d} - {clean(tr['title'])}" if kind == "album" else clean(label)
@@ -1032,6 +1132,10 @@ def newest_media_file(folders):
 
 def menu_gallery_fix():
     say("\n== Fix: show downloads in Gallery / Music app ==")
+    gallery_fix()
+
+
+def gallery_fix():
     folders = [d for d in (cfg["music_dir"], cfg["video_dir"]) if os.path.isdir(d)]
     if not folders:
         say("Your download folders don't exist yet.", "y")
@@ -1172,6 +1276,19 @@ def menu_video():
     download_video(url, height)
 
 
+def run_batch(links, mode="1", height=None):
+    ok_count = 0
+    for i, link in enumerate(links, 1):
+        check_cancel()
+        set_progress((i - 1) / len(links) * 100, force=True)
+        say(f"\n[{i}/{len(links)}] {link}", "b")
+        ok = music_link(link) if mode == "1" else download_video(link, height)
+        ok_count += bool(ok)
+    set_progress(100, force=True)
+    say(f"\nFinished: {ok_count}/{len(links)} succeeded.", "g")
+    return ok_count == len(links)
+
+
 def menu_batch():
     say("\n== Batch download ==")
     path = clean_path(ask("Path to .txt file (one link per line):"))
@@ -1186,12 +1303,17 @@ def menu_batch():
         say("No links found.", "r")
         return
     mode = ask("1 = music, 2 = video (best quality) [1]:", "1")
-    ok_count = 0
-    for i, link in enumerate(links, 1):
-        say(f"\n[{i}/{len(links)}] {link}", "b")
-        ok = music_link(link) if mode == "1" else download_video(link)
-        ok_count += bool(ok)
-    say(f"\nFinished: {ok_count}/{len(links)} succeeded.", "g")
+    run_batch(links, mode)
+
+
+def download_subs(url, lang="en"):
+    outdir = os.path.join(cfg["video_dir"], "Subtitles")
+    ok = run(YT_DLP + base_args() + ["--skip-download", "--write-subs",
+                                     "--write-auto-subs", "--sub-langs", lang,
+                                     "--convert-subs", "srt", "--no-playlist",
+                                     "-P", outdir, "-o", "%(title)s.%(ext)s", url])
+    say(f"Subtitles folder: {outdir}", "g")
+    return ok
 
 
 def menu_subs():
@@ -1200,12 +1322,17 @@ def menu_subs():
     if not url:
         return
     lang = ask("Language code (en, id, es, ...) [en]:", "en")
-    outdir = os.path.join(cfg["video_dir"], "Subtitles")
-    run(YT_DLP + base_args() + ["--skip-download", "--write-subs",
-                                "--write-auto-subs", "--sub-langs", lang,
-                                "--convert-subs", "srt", "--no-playlist",
-                                "-P", outdir, "-o", "%(title)s.%(ext)s", url])
-    say(f"Subtitles folder: {outdir}", "g")
+    download_subs(url, lang)
+
+
+def download_thumb(url):
+    outdir = os.path.join(cfg["video_dir"], "Thumbnails")
+    ok = run(YT_DLP + base_args() + ["--skip-download", "--write-thumbnail",
+                                     "--convert-thumbnails", "jpg", "--no-playlist",
+                                     "-P", outdir, "-o", "%(title)s.%(ext)s", url])
+    media_scan(outdir)
+    say(f"Thumbnails folder: {outdir}", "g")
+    return ok
 
 
 def menu_thumb():
@@ -1213,12 +1340,7 @@ def menu_thumb():
     url = ask_url()
     if not url:
         return
-    outdir = os.path.join(cfg["video_dir"], "Thumbnails")
-    run(YT_DLP + base_args() + ["--skip-download", "--write-thumbnail",
-                                "--convert-thumbnails", "jpg", "--no-playlist",
-                                "-P", outdir, "-o", "%(title)s.%(ext)s", url])
-    media_scan(outdir)
-    say(f"Thumbnails folder: {outdir}", "g")
+    download_thumb(url)
 
 
 def menu_convert():
@@ -1258,21 +1380,33 @@ def fmt_duration(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def video_info(url):
+    info = probe(url, ["--no-playlist"], flat=False)
+    if not info:
+        return None
+    heights = sorted({f["height"] for f in info.get("formats", [])
+                      if f.get("height")})
+    return {"title": info.get("title"),
+            "uploader": info.get("uploader") or info.get("channel"),
+            "duration": fmt_duration(info.get("duration")),
+            "views": info.get("view_count"),
+            "heights": heights}
+
+
 def menu_info():
     say("\n== Video info ==")
     url = ask_url()
     if not url:
         return
-    info = probe(url, ["--no-playlist"], flat=False)
+    info = video_info(url)
     if not info:
         return
-    heights = sorted({f["height"] for f in info.get("formats", [])
-                      if f.get("height")})
-    print(f"\nTitle    : {info.get('title')}")
-    print(f"Uploader : {info.get('uploader') or info.get('channel')}")
-    print(f"Duration : {fmt_duration(info.get('duration'))}")
-    print(f"Views    : {info.get('view_count')}")
-    print(f"Qualities: {', '.join(f'{h}p' for h in heights) or 'n/a'}")
+    print(f"\nTitle    : {info['title']}")
+    print(f"Uploader : {info['uploader']}")
+    print(f"Duration : {info['duration']}")
+    print(f"Views    : {info['views']}")
+    print(f"Qualities: {', '.join(f'{h}p' for h in info['heights']) or 'n/a'}")
+
 
 CHECK_EVERY = 24 * 3600
 RAW_BASE = UPDATE_REPO.replace("https://github.com/", "https://raw.githubusercontent.com/")
@@ -1410,15 +1544,812 @@ def menu_settings():
         save_cfg()
 
 
-def menu_update():
-    say("\n== Updating tools ==")
+def update_tools():
     say("Installing yt-dlp NIGHTLY (newest YouTube fixes)...", "y")
-    subprocess.call([sys.executable, "-m", "pip", "install", "-U", "--pre",
-                     "yt-dlp", "yt-dlp-ejs"])
+    ok = run([sys.executable, "-m", "pip", "install", "-U", "--pre",
+              "yt-dlp", "yt-dlp-ejs"])
     cfg["last_update"] = time.time()
     save_cfg()
     _flag_cache.clear()
     say("Update finished.", "g")
+    return ok
+
+
+def menu_update():
+    say("\n== Updating tools ==")
+    update_tools()
+
+
+WEB_ROOTS = ["/storage/emulated/0", "/sdcard", os.path.expanduser("~")]
+WEB_MAX_RUNNING = 3
+WEB_KEEP_JOBS = 40
+URL_RE = re.compile(r"^https?://[^\s\x00-\x1f\x7f]{4,2000}$")
+VID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
+LANG_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$")
+AUDIO_FORMATS = ("mp3", "m4a", "flac", "opus")
+QUALITIES = {"best": None, "1080": 1080, "720": 720, "480": 480}
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+_job_seq = 0
+
+
+class Job:
+    def __init__(self, jid, kind, title, opts):
+        self.id = jid
+        self.kind = kind
+        self.title = title
+        self.opts = opts
+        self.status = "queued"
+        self.progress = None
+        self.current = ""
+        self.lines = []
+        self.dropped = 0
+        self.partial = ""
+        self.skip = threading.Event()
+        self.cancel = threading.Event()
+        self.lock = threading.Lock()
+        self.created = time.time()
+
+    def add_text(self, text):
+        with self.lock:
+            self.partial += text
+            parts = self.partial.split("\n")
+            self.partial = parts.pop()
+            for line in parts:
+                self.lines.append(line)
+                plain = JOB_ANSI.sub("", line)
+                if "Next:" in plain:
+                    self.current = plain.split("Next:", 1)[1].strip()
+            overflow = len(self.lines) - 1500
+            if overflow > 0:
+                del self.lines[:overflow]
+                self.dropped += overflow
+
+    def read(self, start):
+        with self.lock:
+            offset = max(start - self.dropped, 0)
+            return self.lines[offset:], self.dropped + len(self.lines)
+
+    def summary(self):
+        return {"id": self.id, "kind": self.kind, "title": self.title,
+                "status": self.status, "progress": self.progress,
+                "current": self.current, "skippable": self.kind in ("music", "batch")}
+
+
+class _Router:
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, text):
+        job = current_job()
+        if job is not None:
+            job.add_text(text)
+            return len(text)
+        return self.real.write(text)
+
+    def flush(self):
+        self.real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def valid_url(u):
+    return isinstance(u, str) and bool(URL_RE.match(u.strip()))
+
+
+def short_title(url):
+    return url if len(url) <= 70 else url[:67] + "..."
+
+
+def safe_dir(value):
+    path = os.path.realpath(os.path.expanduser(str(value).strip()))
+    if not path or "\0" in path or len(path) > 300:
+        raise ValueError("Invalid folder.")
+    roots = [os.path.realpath(r).rstrip(os.sep) for r in WEB_ROOTS]
+    if not any(path == r or path.startswith(r + os.sep) for r in roots):
+        raise ValueError("Folder must be inside your phone storage or Termux home.")
+    return path
+
+
+def build_job(body):
+    kind = body.get("kind")
+    if kind == "gallery":
+        return kind, "Fix Gallery", gallery_fix, {}
+    if kind == "update":
+        return kind, "Update yt-dlp", update_tools, {}
+    if kind == "batch":
+        raw = body.get("urls")
+        if not isinstance(raw, list):
+            raise ValueError("No links given.")
+        urls = [u.strip() for u in raw[:50] if valid_url(u)]
+        if not urls:
+            raise ValueError("No valid links found.")
+        mode = "2" if body.get("mode") == "video" else "1"
+        label = "video" if mode == "2" else "music"
+        return ("batch", f"Batch: {len(urls)} links ({label})",
+                lambda: run_batch(urls, mode), {"batch": True})
+    url = body.get("url")
+    if not valid_url(url):
+        raise ValueError("Please enter a valid link starting with http:// or https://")
+    url = url.strip()
+    playlist = bool(body.get("playlist"))
+    if kind == "music":
+        return kind, short_title(url), lambda: music_link(url), {"playlist": playlist}
+    if kind == "video":
+        quality = str(body.get("quality", "best"))
+        if quality not in QUALITIES:
+            raise ValueError("Unknown quality.")
+        height = QUALITIES[quality]
+        return (kind, short_title(url), lambda: download_video(url, height),
+                {"playlist": playlist})
+    if kind == "subs":
+        lang = str(body.get("lang") or "en").strip()
+        if not LANG_RE.match(lang):
+            raise ValueError("Invalid language code.")
+        return kind, "Subtitles: " + short_title(url), lambda: download_subs(url, lang), {}
+    if kind == "thumb":
+        return kind, "Thumbnail: " + short_title(url), lambda: download_thumb(url), {}
+    raise ValueError("Unknown job type.")
+
+
+def _run_job(job, fn):
+    _ctx.job = job
+    job.status = "running"
+    try:
+        result = fn()
+        if job.cancel.is_set():
+            job.status = "cancelled"
+        else:
+            job.status = "failed" if result is False else "done"
+    except JobCancelled:
+        job.status = "cancelled"
+    except Exception as e:
+        job.add_text(f"{COL['r']}Error: {e}{COL['0']}\n")
+        job.status = "failed"
+    finally:
+        if job.status == "done":
+            job.progress = 100.0
+        if job.partial:
+            job.add_text("\n")
+        _ctx.job = None
+
+
+def start_job(spec):
+    global _job_seq
+    kind, title, fn, opts = spec
+    with JOBS_LOCK:
+        active = sum(1 for j in JOBS.values() if j.status in ("queued", "running"))
+        if active >= WEB_MAX_RUNNING:
+            raise ValueError(f"Too many running tasks (max {WEB_MAX_RUNNING}). "
+                             "Wait for one to finish.")
+        _job_seq += 1
+        job = Job(str(_job_seq), kind, title, opts)
+        JOBS[job.id] = job
+        finished = sorted((j for j in JOBS.values()
+                           if j.status not in ("queued", "running")),
+                          key=lambda j: int(j.id))
+        for old in finished[:max(0, len(JOBS) - WEB_KEEP_JOBS)]:
+            JOBS.pop(old.id, None)
+    threading.Thread(target=_run_job, args=(job, fn), daemon=True).start()
+    return job
+
+
+def job_list():
+    with JOBS_LOCK:
+        jobs = sorted(JOBS.values(), key=lambda j: int(j.id), reverse=True)
+    return [j.summary() for j in jobs]
+
+
+def web_settings():
+    return {"music_dir": cfg["music_dir"], "video_dir": cfg["video_dir"],
+            "audio_format": cfg["audio_format"]}
+
+
+def web_search(query):
+    out = []
+    for e in search_youtube(query, 8):
+        vid = str(e.get("id", ""))
+        if not VID_RE.match(vid):
+            continue
+        out.append({"id": vid,
+                    "title": str(e.get("title") or "")[:200],
+                    "channel": str(e.get("channel") or e.get("uploader") or "")[:80],
+                    "duration": fmt_duration(e.get("duration")),
+                    "thumb": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"})
+    return out
+
+
+def _int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class WebHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "MediaDL"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, data, ctype="application/json; charset=utf-8", extra=None):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj))
+
+    def _guard(self, post=False):
+        hosts = {f"127.0.0.1:{self.server.port}", f"localhost:{self.server.port}"}
+        if (self.headers.get("Host") or "").lower() not in hosts:
+            self._json({"error": "bad host"}, 403)
+            return False
+        origin = self.headers.get("Origin")
+        if post and origin and origin.lower() not in {f"http://{h}" for h in hosts}:
+            self._json({"error": "bad origin"}, 403)
+            return False
+        return True
+
+    def _token_ok(self, value):
+        return hmac.compare_digest(str(value).encode("utf-8"),
+                                   self.server.token.encode("utf-8"))
+
+    def do_GET(self):
+        if not self._guard():
+            return
+        parts = urllib.parse.urlsplit(self.path)
+        qs = urllib.parse.parse_qs(parts.query)
+        if parts.path == "/":
+            if not self._token_ok((qs.get("t") or [""])[0]):
+                self._json({"error": "forbidden"}, 403)
+                return
+            nonce = secrets.token_urlsafe(12)
+            page = WEB_PAGE.replace("__NONCE__", nonce).replace("__VERSION__", __version__)
+            csp = (f"default-src 'none'; script-src 'nonce-{nonce}'; "
+                   f"style-src 'nonce-{nonce}'; connect-src 'self'; "
+                   "img-src https://i.ytimg.com; base-uri 'none'; "
+                   "form-action 'none'; frame-ancestors 'none'")
+            self._send(200, page, "text/html; charset=utf-8",
+                       {"Content-Security-Policy": csp})
+            return
+        if not self._token_ok(self.headers.get("X-Token", "")):
+            self._json({"error": "forbidden"}, 403)
+            return
+        try:
+            self._route_get(parts.path, qs)
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
+        except KeyError:
+            self._json({"error": "not found"}, 404)
+        except Exception:
+            self._json({"error": "server error"}, 500)
+
+    def _route_get(self, path, qs):
+        if path == "/api/state":
+            self._json({"version": __version__, "settings": web_settings(),
+                        "jobs": job_list()})
+            return
+        if path == "/api/jobs":
+            self._json({"jobs": job_list()})
+            return
+        m = re.match(r"^/api/jobs/(\d{1,9})$", path)
+        if m:
+            job = JOBS[m.group(1)]
+            lines, nxt = job.read(_int((qs.get("from") or ["0"])[0]))
+            self._json({"lines": lines, "next": nxt, "status": job.status,
+                        "progress": job.progress})
+            return
+        if path == "/api/search":
+            query = re.sub(r"[\x00-\x1f\x7f]", " ", (qs.get("q") or [""])[0]).strip()[:120]
+            if len(query) < 2:
+                raise ValueError("Type at least 2 characters.")
+            self._json({"results": web_search(query)})
+            return
+        if path == "/api/info":
+            url = (qs.get("url") or [""])[0].strip()
+            if not valid_url(url):
+                raise ValueError("Please enter a valid link.")
+            info = video_info(url)
+            if not info:
+                raise ValueError("Could not read that link.")
+            self._json(info)
+            return
+        if path == "/api/versioncheck":
+            info, err = read_version_info()
+            if info is None:
+                raise ValueError(f"Could not check for updates: {err}")
+            self._json({"current": __version__, "latest": info["version"],
+                        "changelog": info["changelog"],
+                        "newer": _ver_tuple(info["version"]) > _ver_tuple(__version__)})
+            return
+        raise KeyError(path)
+
+    def do_POST(self):
+        if not self._guard(post=True):
+            return
+        if not self._token_ok(self.headers.get("X-Token", "")):
+            self._json({"error": "forbidden"}, 403)
+            return
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._json({"error": "json required"}, 415)
+            return
+        length = _int(self.headers.get("Content-Length"), -1)
+        if length < 0 or length > 65536:
+            self._json({"error": "bad size"}, 413)
+            return
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            self._json({"error": "bad json"}, 400)
+            return
+        if not isinstance(body, dict):
+            self._json({"error": "bad json"}, 400)
+            return
+        try:
+            self._route_post(urllib.parse.urlsplit(self.path).path, body)
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
+        except KeyError:
+            self._json({"error": "not found"}, 404)
+        except Exception:
+            self._json({"error": "server error"}, 500)
+
+    def _route_post(self, path, body):
+        if path == "/api/jobs":
+            job = start_job(build_job(body))
+            self._json({"job": job.summary()})
+            return
+        m = re.match(r"^/api/jobs/(\d{1,9})/(skip|cancel)$", path)
+        if m:
+            job = JOBS[m.group(1)]
+            (job.skip if m.group(2) == "skip" else job.cancel).set()
+            self._json({"ok": True})
+            return
+        if path == "/api/settings":
+            music_dir = safe_dir(body.get("music_dir", cfg["music_dir"]))
+            video_dir = safe_dir(body.get("video_dir", cfg["video_dir"]))
+            fmt = str(body.get("audio_format", cfg["audio_format"])).lower()
+            if fmt not in AUDIO_FORMATS:
+                raise ValueError("Unsupported audio format.")
+            cfg.update(music_dir=music_dir, video_dir=video_dir, audio_format=fmt)
+            save_cfg()
+            self._json({"settings": web_settings()})
+            return
+        raise KeyError(path)
+
+
+def run_web(port=8765):
+    server = None
+    for candidate in range(port, port + 20):
+        try:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", candidate), WebHandler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        say("Could not find a free port.", "r")
+        return
+    server.daemon_threads = True
+    server.port = server.server_address[1]
+    server.token = secrets.token_urlsafe(18)
+    url = f"http://127.0.0.1:{server.port}/?t={server.token}"
+
+    say("\n== MediaDL Web ==", "b")
+    say("Open this link in your phone's browser (it contains a secret key):", "y")
+    print(f"\n  {url}\n")
+    say("Only this phone can open it. Keep Termux open while you use it.", "y")
+    say("Press Ctrl+C here to stop the web server.\n", "y")
+
+    wake = shutil.which("termux-wake-lock")
+    if wake:
+        subprocess.run([wake], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    opener = shutil.which("termux-open-url")
+    if opener:
+        try:
+            subprocess.run([opener, url], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    real_stdout = sys.stdout
+    sys.stdout = _Router(real_stdout)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout = real_stdout
+        for job in list(JOBS.values()):
+            job.cancel.set()
+        time.sleep(0.5)
+        server.server_close()
+        unlock = shutil.which("termux-wake-unlock")
+        if unlock:
+            subprocess.run([unlock], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        say("\nWeb server stopped.", "g")
+
+
+def menu_web():
+    say("\n== Web interface ==")
+    run_web()
+
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>MediaDL by mrk</title>
+<style nonce="__NONCE__">
+:root{--bg:#0e1116;--card:#171b22;--card2:#1f242d;--line:#2a303b;--text:#e9ecf2;--muted:#8f97a6;--acc:#5b8cff;--acc2:#3d6ae0;--ok:#3ecf8e;--err:#ff6b6b;--warn:#ffd166;--cy:#5ad1e6}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:max(10px,env(safe-area-inset-top)) 12px max(90px,env(safe-area-inset-bottom))}
+.wrap{max-width:680px;margin:0 auto}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 2px 12px}
+h1{font-size:19px;margin:0;letter-spacing:.2px}
+h1 span{color:var(--acc)}
+.chip{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 9px}
+nav{display:flex;gap:6px;overflow-x:auto;padding-bottom:8px;scrollbar-width:none}
+nav::-webkit-scrollbar{display:none}
+nav button{flex:0 0 auto;background:var(--card);color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:8px 14px;font:inherit;cursor:pointer}
+nav button.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:10px 0}
+.card h2{font-size:15px;margin:0 0 6px}
+label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+input[type=text],input[type=url],textarea,select{width:100%;background:var(--card2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:11px 12px;font:inherit;outline:none}
+input:focus,textarea:focus,select:focus{border-color:var(--acc)}
+textarea{min-height:130px;resize:vertical}
+.row{display:flex;gap:8px;align-items:center}
+.check{display:flex;gap:8px;align-items:center;margin:10px 0 0;color:var(--muted);font-size:14px}
+.check input{width:18px;height:18px}
+.check label{margin:0}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:11px 16px;font:inherit;font-weight:600;cursor:pointer;margin-top:12px}
+.btn:active{background:var(--acc2)}
+.btn.ghost{background:var(--card2);color:var(--text);border:1px solid var(--line)}
+.btn.small{padding:6px 11px;font-size:13px;margin-top:0}
+.btn:disabled{opacity:.5}
+.muted{color:var(--muted);font-size:13px;margin:6px 0 0}
+.panel{display:none}
+.panel.on{display:block}
+.res{display:flex;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line)}
+.res:first-child{border-top:0}
+.res img{width:88px;height:50px;object-fit:cover;border-radius:8px;background:var(--card2);flex:0 0 auto}
+.res .t{flex:1;min-width:0}
+.res .t b{font-weight:600;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.res .t span{font-size:12px;color:var(--muted)}
+.job{border-top:1px solid var(--line);padding:11px 0}
+.job:first-child{border-top:0}
+.jt{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.jt b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.st{font-size:12px;border-radius:999px;padding:2px 9px;background:var(--card2);color:var(--muted);flex:0 0 auto}
+.st.running{color:var(--cy)}
+.st.done{color:var(--ok)}
+.st.failed{color:var(--err)}
+.st.cancelled{color:var(--warn)}
+.bar{height:6px;background:var(--card2);border-radius:999px;overflow:hidden;margin:8px 0}
+.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .4s}
+.bar.ind i{width:40%;transition:none;animation:mv 1.1s linear infinite}
+@keyframes mv{from{margin-left:-40%}to{margin-left:100%}}
+.cur{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acts{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.acts.top{margin-top:12px}
+.log{display:none;background:#0a0c10;border:1px solid var(--line);border-radius:10px;padding:8px;margin-top:8px;max-height:260px;overflow:auto;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.log.on{display:block}
+.log .g{color:var(--ok)}
+.log .r{color:var(--err)}
+.log .y{color:var(--warn)}
+.log .c{color:var(--cy)}
+.log .b{font-weight:700}
+#toast{position:fixed;left:12px;right:12px;bottom:max(14px,env(safe-area-inset-bottom));max-width:660px;margin:0 auto;background:#222836;border:1px solid var(--line);border-radius:12px;padding:11px 14px;display:none;z-index:9}
+#toast.on{display:block}
+#toast.err{border-color:var(--err)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:14px;margin-top:12px}
+.kv span:nth-child(odd){color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><h1>MediaDL <span>by mrk</span></h1><span class="chip">v__VERSION__</span></header>
+<nav id="tabs">
+<button data-tab="music" class="on">Music</button>
+<button data-tab="video">Video</button>
+<button data-tab="search">Search</button>
+<button data-tab="batch">Batch</button>
+<button data-tab="tools">Tools</button>
+<button data-tab="settings">Settings</button>
+</nav>
+
+<section class="panel on" id="tab-music">
+<div class="card">
+<h2>Music download</h2>
+<p class="muted">YouTube, YouTube Music, SoundCloud and Spotify (track, album, playlist). Albums are saved in a folder named after the album.</p>
+<label for="musicUrl">Link</label>
+<input type="url" id="musicUrl" placeholder="https://..." autocomplete="off" autocapitalize="off" spellcheck="false">
+<div class="check"><input type="checkbox" id="musicPl"><label for="musicPl">Song inside a playlist: download the whole playlist</label></div>
+<button class="btn" id="goMusic">Download music</button>
+</div>
+</section>
+
+<section class="panel" id="tab-video">
+<div class="card">
+<h2>Video download</h2>
+<p class="muted">YouTube, TikTok (no watermark), Instagram and more.</p>
+<label for="videoUrl">Link</label>
+<input type="url" id="videoUrl" placeholder="https://..." autocomplete="off" autocapitalize="off" spellcheck="false">
+<label for="videoQ">Quality</label>
+<select id="videoQ"><option value="best">Best available</option><option value="1080">1080p</option><option value="720">720p</option><option value="480">480p</option></select>
+<div class="check"><input type="checkbox" id="videoPl"><label for="videoPl">Video inside a playlist: download the whole playlist</label></div>
+<button class="btn" id="goVideo">Download video</button>
+</div>
+</section>
+
+<section class="panel" id="tab-search">
+<div class="card">
+<h2>Search &amp; download by name</h2>
+<label for="searchQ">Song name</label>
+<div class="row"><input type="text" id="searchQ" placeholder="Artist - Song" autocomplete="off"><button class="btn small" id="goSearch">Search</button></div>
+<div id="searchOut"></div>
+</div>
+</section>
+
+<section class="panel" id="tab-batch">
+<div class="card">
+<h2>Batch download</h2>
+<p class="muted">One link per line (max 50). Lines starting with # are ignored.</p>
+<label for="batchLinks">Links</label>
+<textarea id="batchLinks" placeholder="https://...&#10;https://..." spellcheck="false" autocapitalize="off"></textarea>
+<label for="batchMode">Download as</label>
+<select id="batchMode"><option value="music">Music</option><option value="video">Video (best quality)</option></select>
+<button class="btn" id="goBatch">Start batch</button>
+</div>
+</section>
+
+<section class="panel" id="tab-tools">
+<div class="card">
+<h2>Link tools</h2>
+<label for="toolUrl">Link</label>
+<input type="url" id="toolUrl" placeholder="https://..." autocomplete="off" autocapitalize="off" spellcheck="false">
+<div class="acts top">
+<button class="btn ghost small" id="goInfo">Show info</button>
+<button class="btn ghost small" id="goThumb">Thumbnail</button>
+</div>
+<label for="subLang">Subtitles language</label>
+<div class="row"><input type="text" id="subLang" value="en" maxlength="12" autocomplete="off"><button class="btn small" id="goSubs">Get subtitles</button></div>
+<div id="infoOut"></div>
+</div>
+<div class="card">
+<h2>Maintenance</h2>
+<div class="acts top">
+<button class="btn ghost small" id="goGallery">Fix Gallery</button>
+<button class="btn ghost small" id="goUpdate">Update yt-dlp</button>
+<button class="btn ghost small" id="goVersion">Check MediaDL update</button>
+</div>
+<p class="muted">To update MediaDL itself, close the web page, stop the server with Ctrl+C in Termux and use menu option 10.</p>
+</div>
+</section>
+
+<section class="panel" id="tab-settings">
+<div class="card">
+<h2>Settings</h2>
+<label for="setMusic">Music folder</label>
+<input type="text" id="setMusic" autocomplete="off" autocapitalize="off" spellcheck="false">
+<label for="setVideo">Video folder</label>
+<input type="text" id="setVideo" autocomplete="off" autocapitalize="off" spellcheck="false">
+<label for="setFmt">Audio format</label>
+<select id="setFmt"><option>mp3</option><option>m4a</option><option>flac</option><option>opus</option></select>
+<p class="muted">Folders must be inside your phone storage or the Termux home folder.</p>
+<button class="btn" id="goSave">Save settings</button>
+</div>
+</section>
+
+<div class="card" id="jobsCard">
+<h2>Downloads</h2>
+<div id="jobs"></div>
+<p class="muted" id="noJobs">Nothing yet. Start a download above.</p>
+</div>
+</div>
+<div id="toast"></div>
+<script nonce="__NONCE__">
+(function(){
+'use strict';
+var TOKEN=new URLSearchParams(location.search).get('t')||'';
+var cards={},hidden={},toastTimer=null;
+function $(s,r){return (r||document).querySelector(s);}
+function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));}
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
+function toast(msg,bad){var t=$('#toast');t.textContent=msg;t.className=bad?'on err':'on';clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.className='';},4000);}
+function api(path,opt){
+  opt=opt||{};
+  var headers={'X-Token':TOKEN};
+  var init={method:opt.method||'GET',headers:headers,cache:'no-store'};
+  if(opt.body!==undefined){headers['Content-Type']='application/json';init.body=JSON.stringify(opt.body);}
+  return fetch(path,init).then(function(r){
+    return r.json().catch(function(){return {};}).then(function(d){
+      if(!r.ok)throw new Error(d.error||('Error '+r.status));
+      return d;
+    });
+  });
+}
+function busy(btn,promise){
+  btn.disabled=true;
+  return promise.catch(function(e){toast(e.message,true);}).then(function(){btn.disabled=false;});
+}
+$$('#tabs button').forEach(function(b){
+  b.addEventListener('click',function(){
+    $$('#tabs button').forEach(function(x){x.classList.toggle('on',x===b);});
+    $$('.panel').forEach(function(p){p.classList.toggle('on',p.id==='tab-'+b.dataset.tab);});
+  });
+});
+function startJob(body,btn){
+  return busy(btn,api('/api/jobs',{method:'POST',body:body}).then(function(d){
+    toast('Started: '+d.job.title);
+    refresh();
+    $('#jobsCard').scrollIntoView({behavior:'smooth',block:'start'});
+  }));
+}
+function onEnter(id,fn){$(id).addEventListener('keydown',function(e){if(e.key==='Enter')fn();});}
+function val(id){return $(id).value.trim();}
+function goMusic(){startJob({kind:'music',url:val('#musicUrl'),playlist:$('#musicPl').checked},$('#goMusic'));}
+function goVideo(){startJob({kind:'video',url:val('#videoUrl'),quality:$('#videoQ').value,playlist:$('#videoPl').checked},$('#goVideo'));}
+$('#goMusic').addEventListener('click',goMusic);onEnter('#musicUrl',goMusic);
+$('#goVideo').addEventListener('click',goVideo);onEnter('#videoUrl',goVideo);
+$('#goBatch').addEventListener('click',function(){
+  var urls=$('#batchLinks').value.split('\n').map(function(s){return s.trim();}).filter(function(s){return s&&s.charAt(0)!=='#';});
+  startJob({kind:'batch',urls:urls,mode:$('#batchMode').value,quality:'best'},this);
+});
+$('#goSubs').addEventListener('click',function(){startJob({kind:'subs',url:val('#toolUrl'),lang:val('#subLang')||'en'},this);});
+$('#goThumb').addEventListener('click',function(){startJob({kind:'thumb',url:val('#toolUrl')},this);});
+$('#goGallery').addEventListener('click',function(){startJob({kind:'gallery'},this);});
+$('#goUpdate').addEventListener('click',function(){startJob({kind:'update'},this);});
+$('#goInfo').addEventListener('click',function(){
+  var out=$('#infoOut');out.textContent='';
+  busy(this,api('/api/info?url='+encodeURIComponent(val('#toolUrl'))).then(function(d){
+    var kv=el('div','kv');
+    [['Title',d.title],['Uploader',d.uploader],['Duration',d.duration],['Views',d.views],['Qualities',(d.heights||[]).map(function(h){return h+'p';}).join(', ')||'n/a']].forEach(function(p){
+      kv.appendChild(el('span','',p[0]));
+      kv.appendChild(el('span','',p[1]==null?'':String(p[1])));
+    });
+    out.appendChild(kv);
+  }));
+});
+$('#goVersion').addEventListener('click',function(){
+  busy(this,api('/api/versioncheck').then(function(d){
+    toast(d.newer?('New version v'+d.latest+' available (you have v'+d.current+'). '+d.changelog):('You have the latest version (v'+d.current+').'));
+  }));
+});
+function doSearch(){
+  var q=val('#searchQ'),box=$('#searchOut');
+  if(q.length<2){toast('Type a song name first',true);return;}
+  box.textContent='';box.appendChild(el('p','muted','Searching...'));
+  busy($('#goSearch'),api('/api/search?q='+encodeURIComponent(q)).then(function(d){
+    box.textContent='';
+    if(!d.results.length){box.appendChild(el('p','muted','No results found.'));return;}
+    d.results.forEach(function(r){
+      var row=el('div','res');
+      var img=el('img');
+      if(r.thumb&&r.thumb.indexOf('https://i.ytimg.com/')===0){img.src=r.thumb;}
+      img.alt='';img.loading='lazy';img.referrerPolicy='no-referrer';
+      var t=el('div','t');
+      t.appendChild(el('b','',r.title));
+      t.appendChild(el('span','',r.channel+'  '+r.duration));
+      var b=el('button','btn small','Download');
+      b.addEventListener('click',function(){startJob({kind:'music',url:'https://www.youtube.com/watch?v='+r.id},b);});
+      row.appendChild(img);row.appendChild(t);row.appendChild(b);
+      box.appendChild(row);
+    });
+  }).catch(function(e){box.textContent='';throw e;}));
+}
+$('#goSearch').addEventListener('click',doSearch);onEnter('#searchQ',doSearch);
+$('#goSave').addEventListener('click',function(){
+  busy(this,api('/api/settings',{method:'POST',body:{music_dir:val('#setMusic'),video_dir:val('#setVideo'),audio_format:$('#setFmt').value}}).then(function(d){
+    fillSettings(d.settings);toast('Settings saved');
+  }));
+});
+function fillSettings(s){$('#setMusic').value=s.music_dir;$('#setVideo').value=s.video_dir;$('#setFmt').value=s.audio_format;}
+function ansiInto(node,line){
+  var re=/\x1b\[(\d+)m/g,last=0,cls='',m;
+  function add(t){if(!t)return;if(cls){node.appendChild(el('span',cls,t));}else{node.appendChild(document.createTextNode(t));}}
+  while((m=re.exec(line))){
+    add(line.slice(last,m.index));
+    var c=m[1];
+    if(c==='0')cls='';else if(c==='1')cls='b';else if(c==='91')cls='r';else if(c==='92')cls='g';else if(c==='93')cls='y';else if(c==='96')cls='c';
+    last=re.lastIndex;
+  }
+  add(line.slice(last));
+}
+function appendLog(c,lines){
+  var log=c.log,near=log.scrollHeight-log.scrollTop-log.clientHeight<40;
+  lines.forEach(function(line){
+    var d=el('div');
+    if(line){ansiInto(d,line);}else{d.appendChild(document.createTextNode('\u00a0'));}
+    log.appendChild(d);
+  });
+  while(log.childNodes.length>700)log.removeChild(log.firstChild);
+  if(near)log.scrollTop=log.scrollHeight;
+}
+function makeCard(j){
+  var c={id:j.id,root:el('div','job'),open:false,next:0,status:'',endFetched:false};
+  var top=el('div','jt');
+  c.title=el('b','',j.title);c.st=el('span','st','');
+  top.appendChild(c.title);top.appendChild(c.st);
+  c.bar=el('div','bar');c.fill=el('i');c.bar.appendChild(c.fill);
+  c.cur=el('div','cur');
+  var acts=el('div','acts');
+  c.bLog=el('button','btn ghost small','Log');
+  c.bSkip=el('button','btn ghost small','Skip song');
+  c.bCancel=el('button','btn ghost small','Cancel');
+  c.bHide=el('button','btn ghost small','Hide');
+  [c.bLog,c.bSkip,c.bCancel,c.bHide].forEach(function(b){acts.appendChild(b);});
+  c.log=el('div','log');
+  c.root.appendChild(top);c.root.appendChild(c.bar);c.root.appendChild(c.cur);c.root.appendChild(acts);c.root.appendChild(c.log);
+  c.bLog.addEventListener('click',function(){c.open=!c.open;c.log.classList.toggle('on',c.open);if(c.open)pollLog(c);});
+  c.bSkip.addEventListener('click',function(){api('/api/jobs/'+c.id+'/skip',{method:'POST',body:{}}).then(function(){toast('Skipping current song...');}).catch(function(e){toast(e.message,true);});});
+  c.bCancel.addEventListener('click',function(){api('/api/jobs/'+c.id+'/cancel',{method:'POST',body:{}}).then(function(){toast('Cancelling...');}).catch(function(e){toast(e.message,true);});});
+  c.bHide.addEventListener('click',function(){hidden[c.id]=true;c.root.remove();delete cards[c.id];checkEmpty();});
+  return c;
+}
+function updateCard(c,j){
+  var active=j.status==='running'||j.status==='queued';
+  if(c.status&&c.status!==j.status&&!active){toast(j.title+': '+j.status,j.status==='failed');}
+  c.status=j.status;
+  c.st.textContent=j.status;c.st.className='st '+j.status;
+  if(j.progress==null&&active){c.bar.className='bar ind';}else{c.bar.className='bar';c.fill.style.width=(j.progress==null?(j.status==='done'?100:0):j.progress)+'%';}
+  c.cur.textContent=active&&j.current?('Now: '+j.current):'';
+  c.bSkip.style.display=(j.status==='running'&&j.skippable)?'':'none';
+  c.bCancel.style.display=active?'':'none';
+  c.bHide.style.display=active?'none':'';
+  if(active)c.endFetched=false;
+}
+function pollLog(c){
+  if(!c.open||c.busy)return;
+  var finished=c.status!=='running'&&c.status!=='queued';
+  if(finished&&c.endFetched)return;
+  c.busy=true;
+  api('/api/jobs/'+c.id+'?from='+c.next).then(function(d){
+    if(d.lines.length)appendLog(c,d.lines);
+    c.next=d.next;
+    if(d.status!=='running'&&d.status!=='queued')c.endFetched=true;
+  }).catch(function(){}).then(function(){c.busy=false;});
+}
+function checkEmpty(){$('#noJobs').style.display=Object.keys(cards).length?'none':'';}
+function refresh(){
+  return api('/api/jobs').then(function(d){
+    var box=$('#jobs');
+    d.jobs.slice().reverse().forEach(function(j){
+      if(hidden[j.id])return;
+      var c=cards[j.id];
+      if(!c){c=cards[j.id]=makeCard(j);box.insertBefore(c.root,box.firstChild);}
+      updateCard(c,j);
+      pollLog(c);
+    });
+    checkEmpty();
+  }).catch(function(){});
+}
+if(!TOKEN){toast('Missing key. Open the full link printed in Termux.',true);}
+api('/api/state').then(function(d){fillSettings(d.settings);refresh();}).catch(function(e){toast(e.message,true);});
+setInterval(function(){if(!document.hidden)refresh();},1500);
+})();
+</script>
+</body>
+</html>
+"""
+
 
 MENU = [
     ("1", "Music download (YouTube / Spotify / SoundCloud)", menu_music),
@@ -1434,6 +2365,7 @@ MENU = [
     ("11", "Check / install requirements", menu_requirements),
     ("12", "Search & download song by name", menu_search),
     ("13", "Fix Gallery (show downloads in Gallery)", menu_gallery_fix),
+    ("14", "Web interface (use in your browser)", menu_web),
 ]
 
 
@@ -1466,6 +2398,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if len(sys.argv) > 1 and sys.argv[1] == "web":
+            web_port = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 8765
+            check_requirements()
+            run_web(web_port)
+        else:
+            main()
     except KeyboardInterrupt:
         print()
