@@ -14,7 +14,7 @@ from collections import deque
 from importlib import invalidate_caches
 from importlib.util import find_spec
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 UPDATE_REPO = "https://github.com/mrkkk091/mediadl"
 
 CONFIG_PATH = os.path.expanduser("~/.mediadl.json")
@@ -208,23 +208,60 @@ def cleanup_orphans(folder, before):
 
 
 _gallery_tip_shown = False
+CONTENT_BIN = "/system/bin/content"
+
+
+def _shell_env():
+    env = dict(os.environ)
+    env.pop("LD_PRELOAD", None)
+    env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def _run_quiet(cmd, timeout=25):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=_shell_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return False, ""
+    out = (r.stdout or "") + (r.stderr or "")
+    failed = r.returncode != 0 or re.search(r"exception|error|denied", out, re.I)
+    return not failed, out
 
 
 def media_scan(path):
     global _gallery_tip_shown
-    tool = shutil.which("termux-media-scan")
-    if tool and os.path.exists(path):
-        try:
-            r = subprocess.run([tool, "-r", path], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=30)
-            if r.returncode == 0:
-                return True
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    if not _gallery_tip_shown:
+    strong = False
+    if os.path.exists(path):
+        tool = shutil.which("termux-media-scan")
+        if tool:
+            strong, _ = _run_quiet([tool, "-r", path])
+        if not strong and os.path.exists(CONTENT_BIN):
+            strong, _ = _run_quiet([CONTENT_BIN, "call", "--uri", "content://media/external/file",
+                                    "--method", "scan_file", "--arg", path])
+            if not strong:
+                strong, _ = _run_quiet([CONTENT_BIN, "call", "--uri", "content://media",
+                                        "--method", "scan_volume", "--arg", "external_primary"])
+        if not strong:
+            am = shutil.which("am") or "/system/bin/am"
+            _run_quiet([am, "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                        "-d", f"file://{path}"])
+    if not strong and not _gallery_tip_shown:
         _gallery_tip_shown = True
         say("Tip: if files don't show in Gallery / Music app, use menu option 13.", "y")
-    return False
+    return strong
+
+
+def is_indexed(path):
+    if not os.path.exists(CONTENT_BIN):
+        return None
+    name = os.path.basename(path).replace("'", "''")
+    ok, out = _run_quiet([CONTENT_BIN, "query", "--uri", "content://media/external/file",
+                          "--projection", "_display_name",
+                          "--where", f"_display_name='{name}'"])
+    if not ok:
+        return None
+    return "Row:" in out
 
 
 def platform_of(url):
@@ -243,7 +280,7 @@ PLATFORM_DIR = {"tiktok": "TikTok", "instagram": "Instagram",
 
 IS_TERMUX = bool(shutil.which("pkg")) and os.path.isdir("/data/data/com.termux")
 STALE_DAYS = 30
-ICONS = {"ok": ("✔", "g"), "bad": ("✖", "r"), "warn": ("⚠", "y"), "tip": ("ℹ", "c")}
+ICONS = {"ok": ("✔", "g"), "bad": ("✖", "r"), "warn": ("⚠", "y")}
 
 
 def _pip_version(name):
@@ -320,9 +357,6 @@ def scan_requirements():
         report.append(("ok", "Node.js"))
 
     if IS_TERMUX:
-        if not shutil.which("termux-media-scan"):
-            report.append(("tip", "Gallery refresh not set up - downloads may not show "
-                                  "in Gallery (menu option 13)"))
         if os.access("/storage/emulated/0", os.W_OK):
             report.append(("ok", "Storage permission"))
         else:
@@ -854,31 +888,48 @@ def music_link(url):
     return music_ytdlp(url)
 
 
+def newest_media_file(folders):
+    exts = (".mp4", ".mkv", ".webm", ".mov", ".mp3", ".m4a", ".flac", ".opus")
+    best, best_time = None, 0
+    for folder in folders:
+        for root, _, files in os.walk(folder):
+            for name in files:
+                if not name.lower().endswith(exts):
+                    continue
+                full = os.path.join(root, name)
+                try:
+                    t = os.path.getmtime(full)
+                except OSError:
+                    continue
+                if t > best_time:
+                    best, best_time = full, t
+    return best
+
+
 def menu_gallery_fix():
     say("\n== Fix: show downloads in Gallery / Music app ==")
-    say("Android only lists new files after a media scan. That command comes from "
-        "the 'termux-api' package (not termux-tools) and needs the Termux:API app.", "y")
-    if IS_TERMUX and not shutil.which("termux-media-scan"):
-        say("\nInstalling package termux-api...", "b")
-        subprocess.call(["pkg", "install", "-y", "termux-api"],
-                        env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
-    if not shutil.which("termux-media-scan"):
-        say("The termux-api package is not installed, so scanning is not possible.", "r")
+    folders = [d for d in (cfg["music_dir"], cfg["video_dir"]) if os.path.isdir(d)]
+    if not folders:
+        say("Your download folders don't exist yet.", "y")
         return
-    say("\nNow install the 'Termux:API' app from the same place you got Termux "
-        "(F-Droid or GitHub) and open it once.", "y")
-    ask("Press Enter to scan your folders...")
-    ok = True
-    for folder in (cfg["music_dir"], cfg["video_dir"]):
-        if os.path.isdir(folder):
-            say(f"Scanning {folder} ...", "c")
-            ok = media_scan(folder) and ok
-    if ok:
-        say("\n✔ Done. Open your Gallery. If videos are still missing, close "
-            "and reopen the Gallery app.", "g")
+    for folder in folders:
+        say(f"Scanning {folder} ...", "c")
+        media_scan(folder)
+    latest = newest_media_file(folders)
+    if not latest:
+        say("No downloaded media files found yet.", "y")
+        return
+    say(f"\nChecking your newest file: {os.path.basename(latest)}", "c")
+    state = is_indexed(latest)
+    if state:
+        say("✔ Android knows this file now. Close and reopen your Gallery app.", "g")
+    elif state is False:
+        say("✖ Android has not indexed it yet. No app needed - just do this:", "r")
+        print("  1) Restart your phone (Android rescans storage when it boots).")
+        print("  2) Open your Gallery again after it has started.")
     else:
-        say("\n✖ Scan failed. Check that the Termux:API app is installed (same "
-            "source as Termux) and was opened once, then try again.", "r")
+        say("Could not verify. Close and reopen your Gallery app. If files are "
+            "still missing, restart your phone.", "y")
 
 
 def menu_search():
