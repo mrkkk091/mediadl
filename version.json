@@ -1,4 +1,4 @@
 {
-  "version": "1.0.2",
-  "changelog": "New built-in Spotify downloader (no spotdl needed), search songs by name, fixed requirement checker"
+  "version": "1.0.3",
+  "changelog": "Menu 13 fixes downloads not showing in Gallery (termux-api media scan)"
 }
