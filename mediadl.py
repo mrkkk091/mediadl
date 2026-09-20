@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-MediaDL - all-in-one downloader for Termux
-
-Just run it - on start it checks everything it needs (ffmpeg, Node.js,
-yt-dlp, storage permission...) and offers to install / update what is missing:
-    python mediadl.py
-"""
 import datetime
 import importlib.metadata as md
 import json
@@ -18,33 +10,30 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from importlib import invalidate_caches
 from importlib.util import find_spec
 
-__version__ = "1.0.0"     # bump this when you publish a new version to your repo
+__version__ = "1.0.2"
+UPDATE_REPO = "https://github.com/mrkkk091/mediadl"
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
 CONFIG_PATH = os.path.expanduser("~/.mediadl.json")
 DEFAULTS = {
     "music_dir": "/storage/emulated/0/Music",
     "video_dir": "/storage/emulated/0/Movies",
-    "audio_format": "mp3",   # mp3 / m4a / flac / opus
-    "cookies": "",           # path to cookies.txt (Netscape format), optional
-    "last_update": 0,        # when tools were last updated (epoch seconds)
-    "ignore_until": 0,       # requirement prompt snoozed until (epoch seconds)
-    "spotdl_declined": False,
-    "update_url": "",        # your GitHub repo / raw link of mediadl.py
-    "last_update_check": 0,  # last time the script checked its repo
+    "audio_format": "mp3",
+    "cookies": "",
+    "last_update": 0,
+    "ignore_until": 0,
+    "last_update_check": 0,
 }
+DESKTOP_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 UA = ("Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
 YT_DLP = [sys.executable, "-m", "yt_dlp"]
-SPOTDL = [sys.executable, "-m", "spotdl"]
 VIDEO_EXT = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".3gp", ".flv")
 
-# TikTok: skip the "watermarked" format, prefer the clean one
 TIKTOK_FMT = ("bv*[format_note!*=?watermarked]+ba/b[format_note!*=?watermarked]"
               "/bv*+ba/b")
 
@@ -69,9 +58,6 @@ def save_cfg():
 
 cfg = load_cfg()
 
-# --------------------------------------------------------------------------
-# Small helpers
-# --------------------------------------------------------------------------
 COL = {"g": "\033[92m", "r": "\033[91m", "y": "\033[93m",
        "c": "\033[96m", "b": "\033[1m", "0": "\033[0m"}
 
@@ -104,7 +90,6 @@ def pause():
 
 
 def clean(text):
-    """Make a string safe for a folder/file name."""
     text = re.sub(r'[\\/:*?"<>|$%]', "_", text or "").strip().strip(".")
     return text or "Untitled"
 
@@ -127,7 +112,6 @@ DONE_TAG = "@@DONE@@"
 
 
 def clean_print_args(playlist):
-    """yt-dlp flags: silence everything except our own Next/Done lines."""
     if playlist:
         item = "[%(playlist_index)s/%(n_entries)s] %(title)s"
     else:
@@ -138,8 +122,6 @@ def clean_print_args(playlist):
 
 
 def run_clean(cmd, seen):
-    """Run yt-dlp quietly and show only 'next' / 'done' lines (+ short errors)."""
-    print()
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -172,10 +154,8 @@ def run_clean(cmd, seen):
     return p.returncode == 0, retryable
 
 
-# YouTube sometimes returns "HTTP 403" for one player client but not another.
-# We try the default first, then fall back to other clients automatically.
 CLIENT_SETS = [
-    None,                      # yt-dlp default
+    None,
     "tv,web_safari,mweb",
     "web,mweb,android,tv",
     "ios,android_vr",
@@ -183,7 +163,6 @@ CLIENT_SETS = [
 
 
 def run_yt(cmd, url, clean=False):
-    """Run a yt-dlp command; on failure retry with different YouTube clients."""
     tries = CLIENT_SETS if "youtu" in url.lower() else [None]
     seen = set()
     for i, clients in enumerate(tries):
@@ -196,7 +175,7 @@ def run_yt(cmd, url, clean=False):
             ok, retryable = run(c + [url]), True
         if ok:
             return True
-        if not retryable:      # e.g. video removed - another method won't help
+        if not retryable:
             break
         if i < len(tries) - 1:
             say("\n  Some downloads failed - retrying with another method "
@@ -212,8 +191,6 @@ def snapshot(folder):
 
 
 def cleanup_orphans(folder, before):
-    """Remove thumbnails / partial files left by failed downloads.
-    Only touches files that were created during this download."""
     if not os.path.isdir(folder):
         return
     audio = (".mp3", ".m4a", ".flac", ".opus", ".mp4", ".mkv", ".webm")
@@ -231,7 +208,6 @@ def cleanup_orphans(folder, before):
 
 
 def media_scan(path):
-    """Make new files show up in the gallery / music app right away."""
     tool = shutil.which("termux-media-scan")
     if tool and os.path.exists(path):
         subprocess.run([tool, "-r", path],
@@ -252,12 +228,9 @@ def platform_of(url):
 PLATFORM_DIR = {"tiktok": "TikTok", "instagram": "Instagram",
                 "youtube": "YouTube", "other": "Other"}
 
-# --------------------------------------------------------------------------
-# Setup checks
-# --------------------------------------------------------------------------
 IS_TERMUX = bool(shutil.which("pkg")) and os.path.isdir("/data/data/com.termux")
-STALE_DAYS = 30          # yt-dlp older than this is flagged (YouTube changes often)
-ICONS = {"ok": ("✔", "g"), "bad": ("✖", "r"), "warn": ("⚠", "y"), "opt": ("○", "c")}
+STALE_DAYS = 30
+ICONS = {"ok": ("✔", "g"), "bad": ("✖", "r"), "warn": ("⚠", "y")}
 
 
 def _pip_version(name):
@@ -268,7 +241,6 @@ def _pip_version(name):
 
 
 def _works(cmd):
-    """True if the command runs successfully (catches broken installs)."""
     try:
         return subprocess.run(cmd, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=30).returncode == 0
@@ -286,19 +258,16 @@ def _days_old(version):
         return None
 
 
-def scan_requirements(show_optional=False):
-    """Check everything (offline, fast). Returns (report, plan)."""
+def scan_requirements():
     report = []
     plan = {"storage": False, "pkg_upgrade": False,
             "pkg": [], "pip_pre": [], "pip": []}
     ok_pip = []
 
-    # pip itself
     if find_spec("pip") is None:
         report.append(("bad", "pip - missing"))
         plan["pkg"].append("python-pip")
 
-    # yt-dlp (and how old it is)
     v = _pip_version("yt-dlp")
     if v is None:
         report.append(("bad", "yt-dlp - not installed"))
@@ -321,7 +290,6 @@ def scan_requirements(show_optional=False):
     if ok_pip:
         report.insert(0, ("ok", "Python packages: " + ", ".join(ok_pip)))
 
-    # ffmpeg (test that it really runs - a bad upgrade can break it)
     if not shutil.which("ffmpeg"):
         report.append(("bad", "ffmpeg - missing (needed for MP3 / merging video)"))
         plan["pkg"].append("ffmpeg")
@@ -332,7 +300,6 @@ def scan_requirements(show_optional=False):
     else:
         report.append(("ok", "ffmpeg"))
 
-    # Node.js (YouTube needs a JS runtime)
     if not shutil.which("node") or not _works(["node", "--version"]):
         report.append(("bad", "Node.js - missing (needed for YouTube)"))
         plan["pkg"].append("nodejs")
@@ -340,20 +307,12 @@ def scan_requirements(show_optional=False):
         report.append(("ok", "Node.js"))
 
     if IS_TERMUX:
-        if not shutil.which("termux-media-scan"):
-            report.append(("warn", "termux-tools - missing (files won't show in gallery at once)"))
-            plan["pkg"].append("termux-tools")
         if os.access("/storage/emulated/0", os.W_OK):
             report.append(("ok", "Storage permission"))
         else:
             report.append(("bad", "Storage permission - not granted"))
             plan["storage"] = True
 
-    # Spotify support is optional (heavy to install)
-    if find_spec("spotdl") is not None:
-        report.append(("ok", "spotdl (Spotify)"))
-    elif show_optional or not cfg.get("spotdl_declined"):
-        report.append(("opt", "spotdl - not installed (optional, for Spotify)"))
     return report, plan
 
 
@@ -393,52 +352,15 @@ def install_requirements(plan):
     invalidate_caches()
 
 
-def install_spotdl():
-    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-    if IS_TERMUX:
-        subprocess.call(["pkg", "install", "-y", "rust", "binutils", "clang",
-                         "cmake", "ninja"], env=env)
-        try:
-            api = subprocess.run(["getprop", "ro.build.version.sdk"],
-                                 capture_output=True, text=True).stdout.strip()
-        except OSError:
-            api = ""
-        env["ANDROID_API_LEVEL"] = api or "24"
-    say("\nInstalling spotdl - this can take 10-20 minutes, please wait...", "y")
-    subprocess.call([sys.executable, "-m", "pip", "install", "-U", "spotdl"], env=env)
-    invalidate_caches()
-    if find_spec("spotdl"):
-        say("✔ spotdl installed.", "g")
-    else:
-        say("✖ spotdl could not be installed. Everything else still works.", "r")
-
-
-def offer_spotdl(force=False):
-    if find_spec("spotdl") is not None:
-        return
-    if cfg.get("spotdl_declined") and not force:
-        return
-    ans = ask("\nInstall Spotify support (spotdl)? Takes 10-20 min, may fail. "
-              "[y/N]:", "n").lower()
-    if ans.startswith("y"):
-        cfg["spotdl_declined"] = False
-        install_spotdl()
-    else:
-        cfg["spotdl_declined"] = True
-    save_cfg()
-
-
 def check_requirements(force=False):
-    """Startup check. Returns True if anything was shown to the user."""
     say("Checking requirements...", "y")
-    report, plan = scan_requirements(show_optional=force)
+    report, plan = scan_requirements()
     problems = any(k in ("bad", "warn") for k, _ in report)
 
     if not problems:
         say("✔ All requirements are installed and up to date.", "g")
         if force:
             print_report(report)
-        offer_spotdl(force)
         return force
 
     say("\nSome requirements are missing or outdated:", "b")
@@ -449,22 +371,24 @@ def check_requirements(force=False):
         return True
 
     ans = ask("\nInstall all requirements? (Press ENTER = yes, n = no):").lower()
-    if ans in ("", "y", "yes"):
-        install_requirements(plan)
-        say("\nRe-checking...", "y")
-        report, plan = scan_requirements(show_optional=force)
-        print_report(report)
-        if any(k in ("bad", "warn") for k, _ in report):
-            say("\nSome items still have problems - see above. "
-                "You can continue, but those features may not work.", "r")
-        else:
-            say("\n✔ Everything is ready!", "g")
-    else:
+    if ans not in ("", "y", "yes"):
         cfg["ignore_until"] = time.time() + 3 * 86400
         save_cfg()
         say("\nSkipped. Some features may not work until you install them.", "y")
         return True
-    offer_spotdl(force)
+
+    install_requirements(plan)
+    say("\nRe-checking...", "y")
+    report, plan = scan_requirements()
+    print_report(report)
+    if any(k in ("bad", "warn") for k, _ in report):
+        cfg["ignore_until"] = time.time() + 3 * 86400
+        save_cfg()
+        say("\nSome items could not be fixed automatically - see above. "
+            "You can continue; this won't be asked again for 3 days "
+            "(menu option 11 to retry).", "r")
+    else:
+        say("\n✔ Everything is ready!", "g")
     return True
 
 
@@ -489,7 +413,6 @@ def base_args():
     ck = cfg.get("cookies")
     if ck and os.path.isfile(ck):
         a += ["--cookies", ck]
-    # YouTube needs a JS runtime for some formats; use Node if available
     if shutil.which("node") and ytdlp_has("--js-runtimes"):
         a += ["--js-runtimes", "node"]
     return a
@@ -502,7 +425,6 @@ def dl_args():
 
 
 def probe(url, extra=None, flat=True):
-    """Ask yt-dlp about a link (no download). Returns dict or None."""
     cmd = YT_DLP + base_args() + ["--dump-single-json", "--no-warnings"]
     if flat:
         cmd.append("--flat-playlist")
@@ -515,9 +437,6 @@ def probe(url, extra=None, flat=True):
         say(err, "r")
         return None
 
-# --------------------------------------------------------------------------
-# 1. MUSIC
-# --------------------------------------------------------------------------
 ALBUM_PREFIX = re.compile(r"^(Album|Single|EP)\s*-\s*", re.I)
 
 
@@ -570,44 +489,360 @@ def music_ytdlp(url):
     return ok
 
 
-def music_spotify(url):
-    if find_spec("spotdl") is None:
-        say("Spotify needs 'spotdl'. Install it with:\n"
-            "  pkg install rust binutils\n  pip install spotdl", "r")
+SPOTIFY_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-[a-z-]+/)?(?:embed/)?|spotify:)"
+    r"(track|album|playlist)[/:]([A-Za-z0-9]{22})")
+BAD_WORDS = ("live", "cover", "remix", "karaoke", "instrumental",
+             "reaction", "slowed", "sped up", "nightcore", "8d audio")
+
+
+def http_get(url, limit=3_000_000):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = r.read(limit + 1)
+        final = r.geturl()
+    if len(data) > limit:
+        raise ValueError("response too large")
+    return data, final
+
+
+def parse_spotify_link(url):
+    m = SPOTIFY_RE.search(url)
+    if not m and re.search(r"spotify\.link|spoti\.fi", url):
+        try:
+            _, final = http_get(url)
+            m = SPOTIFY_RE.search(final)
+        except Exception:
+            m = None
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _walk(obj):
+    queue = deque([obj])
+    while queue:
+        cur = queue.popleft()
+        if isinstance(cur, dict):
+            yield cur
+            queue.extend(cur.values())
+        elif isinstance(cur, list):
+            queue.extend(cur)
+
+
+def _txt(v):
+    return re.sub(r"\s+", " ", str(v or "")).strip()
+
+
+def _names(d):
+    artists = d.get("artists")
+    if isinstance(artists, list):
+        names = [_txt(a.get("name")) for a in artists
+                 if isinstance(a, dict) and a.get("name")]
+        if names:
+            return ", ".join(names)
+    return _txt(d.get("subtitle"))
+
+
+def _ms(d):
+    for key in ("duration", "durationMs", "duration_ms"):
+        v = d.get(key)
+        if isinstance(v, dict):
+            v = v.get("totalMilliseconds")
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v if v >= 1000 else v * 1000)
+    return None
+
+
+def _cover_url(ent):
+    best, size = None, -1
+    for d in _walk(ent):
+        for key in ("sources", "image", "images"):
+            images = d.get(key)
+            if not isinstance(images, list):
+                continue
+            for im in images:
+                if not isinstance(im, dict):
+                    continue
+                url = im.get("url")
+                if not (isinstance(url, str) and url.startswith("https://")):
+                    continue
+                w = im.get("width") or im.get("maxWidth") or 0
+                w = w if isinstance(w, (int, float)) else 0
+                if w > size:
+                    best, size = url, w
+    return best
+
+
+def _image_bytes(url):
+    try:
+        data, _ = http_get(url, 5_000_000)
+    except Exception:
+        return None
+    return data if data[:2] == b"\xff\xd8" or data[:4] == b"\x89PNG" else None
+
+
+def spotify_meta(kind, sid):
+    data, _ = http_get(f"https://open.spotify.com/embed/{kind}/{sid}")
+    html = data.decode("utf-8", "replace")
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if m:
+        blob = m.group(1)
+    else:
+        m = re.search(r'<script id="resource"[^>]*>(.*?)</script>', html, re.S)
+        if not m:
+            raise ValueError("no data found in page")
+        blob = urllib.parse.unquote(m.group(1))
+    tree = json.loads(blob)
+
+    wanted = f"spotify:{kind}:{sid}"
+    ent = next((d for d in _walk(tree)
+                if d.get("uri") == wanted and (d.get("name") or d.get("title"))), None)
+    if ent is None:
+        ent = next((d for d in _walk(tree)
+                    if isinstance(d.get("trackList"), list)), None)
+    if ent is None:
+        raise ValueError("item not found in page")
+
+    name = _txt(ent.get("name") or ent.get("title"))
+    artist = _names(ent)
+    tracks = []
+    items = ent.get("trackList")
+    if isinstance(items, list):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            title = _txt(it.get("title") or it.get("name"))
+            if title:
+                tracks.append({"title": title, "artist": _names(it) or artist,
+                               "ms": _ms(it)})
+    elif kind == "track" and name:
+        tracks.append({"title": name, "artist": artist, "ms": _ms(ent)})
+    for i, t in enumerate(tracks, 1):
+        t["n"] = i
+    return {"kind": kind, "name": name, "artist": artist,
+            "tracks": tracks, "cover": _cover_url(ent)}
+
+
+def search_youtube(query, count=6):
+    info = probe(f"ytsearch{count}:{query}")
+    entries = (info or {}).get("entries") or []
+    return [e for e in entries if isinstance(e, dict) and e.get("id")]
+
+
+def pick_match(entries, title, artist, ms):
+    target = ms / 1000 if ms else None
+    title_l = title.lower()
+    artist_l = artist.split(",")[0].strip().lower()
+    best, best_score = None, None
+    for e in entries:
+        t = (e.get("title") or "").lower()
+        ch = (e.get("channel") or e.get("uploader") or "").lower()
+        score = 0
+        dur = e.get("duration")
+        if target and isinstance(dur, (int, float)):
+            diff = abs(dur - target)
+            score += 6 if diff <= 3 else 3 if diff <= 8 else -6 if diff > 20 else 0
+        if ch.endswith("topic"):
+            score += 4
+        if artist_l and artist_l in f"{t} {ch}":
+            score += 2
+        if title_l in t:
+            score += 2
+        for w in BAD_WORDS:
+            if w in t and w not in title_l:
+                score -= 4
+        if "audio" in t:
+            score += 1
+        if best_score is None or score > best_score:
+            best, best_score = e, score
+    return best if best_score is not None and best_score >= 0 else None
+
+
+def tag_audio(path, title, artist, album, album_artist, track, total, cover):
+    ext = os.path.splitext(path)[1].lower()
+    mime = "image/png" if cover and cover[:4] == b"\x89PNG" else "image/jpeg"
+    try:
+        if ext == ".mp3":
+            from mutagen.id3 import ID3, TALB, TIT2, TPE1, TPE2, TRCK, APIC
+            tags = ID3()
+            tags.add(TIT2(encoding=3, text=title))
+            if artist:
+                tags.add(TPE1(encoding=3, text=artist))
+            if album:
+                tags.add(TALB(encoding=3, text=album))
+            if album_artist:
+                tags.add(TPE2(encoding=3, text=album_artist))
+            if track:
+                tags.add(TRCK(encoding=3, text=f"{track}/{total}"))
+            if cover:
+                tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover))
+            tags.save(path, v2_version=3)
+        elif ext in (".m4a", ".mp4"):
+            from mutagen.mp4 import MP4, MP4Cover
+            mf = MP4(path)
+            mf["\xa9nam"] = [title]
+            if artist:
+                mf["\xa9ART"] = [artist]
+            if album:
+                mf["\xa9alb"] = [album]
+            if album_artist:
+                mf["aART"] = [album_artist]
+            if track:
+                mf["trkn"] = [(track, total)]
+            if cover:
+                fmt = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+                mf["covr"] = [MP4Cover(cover, imageformat=fmt)]
+            mf.save()
+        elif ext == ".flac":
+            from mutagen.flac import FLAC, Picture
+            mf = FLAC(path)
+            mf["title"] = [title]
+            if artist:
+                mf["artist"] = [artist]
+            if album:
+                mf["album"] = [album]
+            if album_artist:
+                mf["albumartist"] = [album_artist]
+            if track:
+                mf["tracknumber"] = [str(track)]
+            if cover:
+                pic = Picture()
+                pic.type = 3
+                pic.mime = mime
+                pic.data = cover
+                mf.clear_pictures()
+                mf.add_picture(pic)
+            mf.save()
+        else:
+            import mutagen
+            mf = mutagen.File(path)
+            if mf is None:
+                return
+            mf["title"] = [title]
+            if artist:
+                mf["artist"] = [artist]
+            if album:
+                mf["album"] = [album]
+            if track:
+                mf["tracknumber"] = [str(track)]
+            mf.save()
+    except Exception:
+        pass
+
+
+def download_matched(tr, outdir, stem):
+    entries = search_youtube(f"{tr['artist']} {tr['title']}".strip())
+    match = pick_match(entries, tr["title"], tr["artist"], tr["ms"])
+    if not match:
         return False
-    m = re.search(r"spotify\.com/(?:intl-[a-z-]+/)?(track|album|playlist)/", url)
-    if not m:
+    cmd = YT_DLP + base_args() + [
+        "-x", "--audio-format", cfg["audio_format"], "--audio-quality", "0",
+        "--no-mtime", "--no-playlist", "--quiet", "--no-warnings",
+        "-P", outdir, "-o", f"{stem}.%(ext)s"]
+    return run_yt(cmd, f"https://www.youtube.com/watch?v={match['id']}", clean=True)
+
+
+def search_and_download(query):
+    say("Searching...", "y")
+    entries = search_youtube(query, 5)
+    if not entries:
+        say("No results found.", "r")
+        return False
+    for i, e in enumerate(entries, 1):
+        who = e.get("channel") or e.get("uploader") or ""
+        print(f" {i}) {e.get('title')}  [{fmt_duration(e.get('duration'))}]  {who}")
+    pick = ask("Choose number [1] (n = cancel):", "1")
+    if pick.lower() == "n":
+        return False
+    idx = int(pick) - 1 if pick.isdigit() and 1 <= int(pick) <= len(entries) else 0
+    return music_ytdlp(f"https://www.youtube.com/watch?v={entries[idx]['id']}")
+
+
+def spotify_fallback(kind, sid):
+    if kind != "track":
+        say("Tip: paste this album's YouTube Music link in the music option, "
+            "or search songs by name (option 12).", "y")
+        return False
+    title = ""
+    try:
+        api = ("https://open.spotify.com/oembed?url="
+               + urllib.parse.quote(f"https://open.spotify.com/track/{sid}", safe=""))
+        data, _ = http_get(api, 200_000)
+        title = _txt(json.loads(data.decode("utf-8")).get("title"))
+    except Exception:
+        pass
+    q = ask(f"Song name to search [{title or 'type it'}] (n = cancel):", title)
+    if not q or q.lower() == "n":
+        return False
+    return search_and_download(q)
+
+
+def music_spotify(url):
+    ref = parse_spotify_link(url)
+    if not ref:
         say("Only Spotify track, album and playlist links are supported.", "r")
         return False
-    kind = m.group(1)
-    url = url.split("?")[0]
-    base = cfg["music_dir"]
-
-    if kind == "album":        # folder name = exact album name
-        tmpl = f"{base}/{{album}}/{{track-number}} - {{title}}.{{output-ext}}"
-        outdir = base
-    elif kind == "playlist":
-        tmpl = f"{base}/{{list-name}}/{{artists}} - {{title}}.{{output-ext}}"
-        outdir = base
-    else:
-        tmpl = f"{base}/{{artists}} - {{title}}.{{output-ext}}"
-        outdir = base
+    kind, sid = ref
+    say("Reading Spotify link...", "y")
+    try:
+        meta = spotify_meta(kind, sid)
+    except Exception as e:
+        say(f"Could not read this Spotify link ({e}).", "r")
+        return spotify_fallback(kind, sid)
+    tracks = meta["tracks"]
+    if not tracks:
+        say("No tracks found in that link.", "r")
+        return spotify_fallback(kind, sid)
 
     fmt = cfg["audio_format"]
-    cmd = SPOTDL + ["download", url, "--output", tmpl, "--format", fmt]
-    if fmt != "flac":
-        cmd += ["--bitrate", "auto"]
-    ok = run(cmd)
+    single = kind == "track"
+    outdir = cfg["music_dir"] if single else os.path.join(cfg["music_dir"], clean(meta["name"]))
+    total = len(tracks)
+    if single:
+        say(f"\nTrack: {meta['name']}", "b")
+    else:
+        say(f"\n{kind.title()}: {meta['name']}  ({total} tracks)", "b")
+        if kind == "playlist" and total >= 50:
+            say("Note: Spotify only shares the first ~50 tracks of a playlist.", "y")
+    say(f"Saving to: {outdir}", "y")
+
+    cover = _image_bytes(meta["cover"]) if meta["cover"] else None
+    done = 0
+    for tr in tracks:
+        label = f"{tr['artist']} - {tr['title']}" if tr["artist"] else tr["title"]
+        prefix = "" if single else f"[{tr['n']:02d}/{total}] "
+        stem = f"{tr['n']:02d} - {clean(tr['title'])}" if kind == "album" else clean(label)
+        dest = os.path.join(outdir, f"{stem}.{fmt}")
+        if os.path.exists(dest):
+            say(f"  ✔ Already saved: {prefix}{label}", "g")
+            done += 1
+            continue
+        say(f"  → Next: {prefix}{label}", "c")
+        if download_matched(tr, outdir, stem) and os.path.exists(dest):
+            tag_audio(dest, tr["title"], tr["artist"],
+                      "" if single else meta["name"],
+                      meta["artist"] if kind == "album" else "",
+                      0 if single else tr["n"], total, cover)
+            say(f"  ✔ Done: {prefix}{label}", "g")
+            done += 1
+        else:
+            say(f"  ✖ Could not download: {prefix}{label}", "r")
     media_scan(outdir)
-    if ok:
-        say(f"Done -> {base}", "g")
-    return ok
+    say(f"\nFinished: {done}/{total} tracks -> {outdir}", "g" if done == total else "y")
+    return done == total
 
 
 def music_link(url):
     if "spotify.com" in url.lower():
         return music_spotify(url)
     return music_ytdlp(url)
+
+
+def menu_search():
+    say("\n== Search & download song by name ==")
+    q = ask("Song name (e.g. Rick Astley Never Gonna Give You Up):")
+    if q:
+        search_and_download(q)
 
 
 def menu_music():
@@ -617,11 +852,8 @@ def menu_music():
     if url:
         music_link(url)
 
-# --------------------------------------------------------------------------
-# 2. VIDEO
-# --------------------------------------------------------------------------
+
 def tiktok_backup(url, outdir):
-    """Fallback: public tikwm API returns a watermark-free (HD) file."""
     try:
         api = "https://www.tikwm.com/api/?hd=1&url=" + urllib.parse.quote(url, safe="")
         req = urllib.request.Request(api, headers={"User-Agent": UA})
@@ -653,7 +885,7 @@ def tiktok_backup(url, outdir):
         print()
         say(f"Saved: {dest}", "g")
         return True
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         say(f"Backup failed: {e}", "r")
         return False
 
@@ -663,7 +895,6 @@ def download_video(url, height=None):
     outdir = os.path.join(cfg["video_dir"], PLATFORM_DIR[plat])
     cmd = YT_DLP + dl_args() + ["--merge-output-format", "mp4"]
 
-    # format selection
     if plat == "tiktok":
         cmd += ["-f", TIKTOK_FMT]
     else:
@@ -673,7 +904,6 @@ def download_video(url, height=None):
             cmd += ["-f", "bv*+ba/b"]
         cmd += ["-S", "res,vcodec:h264,acodec:m4a"]
 
-    # playlist handling (YouTube & others)
     playlist = False
     if plat in ("youtube", "other") and "list=" in url:
         if re.search(r"[?&]v=", url):
@@ -722,9 +952,7 @@ def menu_video():
         height = {"2": 1080, "3": 720, "4": 480}.get(ask("Choose [1]:", "1"))
     download_video(url, height)
 
-# --------------------------------------------------------------------------
-# 3. BATCH
-# --------------------------------------------------------------------------
+
 def menu_batch():
     say("\n== Batch download ==")
     path = clean_path(ask("Path to .txt file (one link per line):"))
@@ -746,9 +974,7 @@ def menu_batch():
         ok_count += bool(ok)
     say(f"\nFinished: {ok_count}/{len(links)} succeeded.", "g")
 
-# --------------------------------------------------------------------------
-# 4-7. EXTRAS
-# --------------------------------------------------------------------------
+
 def menu_subs():
     say("\n== Download subtitles ==")
     url = ask_url()
@@ -829,59 +1055,57 @@ def menu_info():
     print(f"Views    : {info.get('view_count')}")
     print(f"Qualities: {', '.join(f'{h}p' for h in heights) or 'n/a'}")
 
-# --------------------------------------------------------------------------
-# 8-9. SETTINGS & UPDATE
-# --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
-# SCRIPT SELF-UPDATER (checks your repository for a newer mediadl.py)
-# --------------------------------------------------------------------------
-CHECK_EVERY = 24 * 3600      # automatic check at most once a day
-
-
-def normalize_update_url(text):
-    """Turn a GitHub repo/file link (or raw link) into raw-file URL(s) to try."""
-    t = (text or "").strip().rstrip("/")
-    if not t.lower().startswith("https://"):
-        return []
-    m = re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?"
-                 r"(?:/(?:blob|raw|tree)/([^/]+)(?:/(.+))?)?$", t)
-    if m:
-        user, repo, branch, path = m.groups()
-        if not path or not path.endswith(".py"):
-            path = "mediadl.py"
-        branches = [branch] if branch else ["main", "master"]
-        return [f"https://raw.githubusercontent.com/{user}/{repo}/{b}/{path}"
-                for b in branches]
-    return [t]
+CHECK_EVERY = 24 * 3600
+RAW_BASE = UPDATE_REPO.replace("https://github.com/", "https://raw.githubusercontent.com/")
+BRANCHES = ("main", "master")
+VERSION_RE = re.compile(r"^\d+(\.\d+){0,3}$")
 
 
 def _ver_tuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or "")) or (0,)
 
 
-def fetch_remote_script(url_text):
-    """Download the script from the repo. Returns (code, error)."""
-    urls = normalize_update_url(url_text)
-    if not urls:
-        return None, "link must start with https://"
+def fetch_repo_file(name, limit=2_000_000):
     err = "unknown error"
-    for u in urls:
+    for branch in BRANCHES:
         try:
             req = urllib.request.Request(
-                u, headers={"User-Agent": UA, "Cache-Control": "no-cache"})
+                f"{RAW_BASE}/{branch}/{name}",
+                headers={"User-Agent": UA, "Cache-Control": "no-cache"})
             with urllib.request.urlopen(req, timeout=8) as r:
-                data = r.read(2_000_001)
-            if len(data) > 2_000_000:
+                data = r.read(limit + 1)
+            if len(data) > limit:
                 err = "file is too large"
                 continue
             return data.decode("utf-8"), None
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             err = str(e)
     return None, err
 
 
+def read_version_info():
+    text, err = fetch_repo_file("version.json")
+    if text is None:
+        return None, err
+    try:
+        info = json.loads(text)
+        version = str(info["version"]).strip()
+        if not VERSION_RE.match(version):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        return None, "version.json is invalid"
+    notes = re.sub(r"[^\x20-\x7e\u00a0-\uffff]", "", str(info.get("changelog", "")))
+    return {"version": version, "changelog": notes[:300]}, None
+
+
 def apply_script_update(code, new_ver):
-    """Verify the downloaded code, back up the current file, replace it, restart."""
+    m = re.search(r"^__version__\s*=\s*[\"']([\d.]+)[\"']", code, re.M)
+    if not m or "def main" not in code:
+        say("Downloaded file is not a valid mediadl.py - update cancelled.", "r")
+        return False
+    if _ver_tuple(m.group(1)) < _ver_tuple(new_ver):
+        say("The new file is not ready on GitHub yet. Try again in a few minutes.", "y")
+        return False
     try:
         compile(code, "mediadl.py", "exec")
     except SyntaxError as e:
@@ -905,45 +1129,35 @@ def apply_script_update(code, new_ver):
 
 
 def check_script_update(auto=False):
-    """Compare our version with the repo. auto=True = quiet startup check."""
-    url = cfg.get("update_url", "")
-    if not url:
-        if not auto:
-            say("No update repository set. Set it in Settings (option 8 -> 5).", "y")
-        return
     if auto and time.time() - cfg.get("last_update_check", 0) < CHECK_EVERY:
         return
     if not auto:
-        say("Checking for a new version of mediadl.py...", "y")
-    code, err = fetch_remote_script(url)
-    if code is None:
+        say("Checking for a new version...", "y")
+    info, err = read_version_info()
+    if info is None:
         if not auto:
-            say(f"Could not reach the repository: {err}", "r")
+            say(f"Could not check for updates: {err}", "r")
         return
     cfg["last_update_check"] = time.time()
     save_cfg()
-    m = re.search(r"^__version__\s*=\s*[\"']([\d.]+)[\"']", code, re.M)
-    if not m or "def main" not in code:
-        if not auto:
-            say("That file doesn't look like mediadl.py (no __version__ found).", "r")
-        return
-    remote = m.group(1)
+    remote = info["version"]
     if _ver_tuple(remote) <= _ver_tuple(__version__):
         if not auto:
             say(f"✔ You have the latest version (v{__version__}).", "g")
         return
-    try:                       # never offer a broken update
-        compile(code, "mediadl.py", "exec")
-    except SyntaxError:
-        if not auto:
-            say(f"v{remote} exists but its code is broken - skipped.", "r")
-        return
     say(f"\n🔔 New version available: v{remote}  (you have v{__version__})", "b")
+    if info["changelog"]:
+        say(f"What's new: {info['changelog']}", "c")
     ans = ask("Update now? (Press ENTER = yes, n = later):").lower()
-    if ans in ("", "y", "yes"):
-        apply_script_update(code, remote)
-    else:
+    if ans not in ("", "y", "yes"):
         say("OK - you can update any time from menu option 10.", "y")
+        return
+    say("Downloading...", "y")
+    code, err = fetch_repo_file("mediadl.py")
+    if code is None:
+        say(f"Download failed: {err}", "r")
+        return
+    apply_script_update(code, remote)
 
 
 def menu_script_update():
@@ -958,7 +1172,6 @@ def menu_settings():
         print(f"2) Video folder : {cfg['video_dir']}")
         print(f"3) Audio format : {cfg['audio_format']}")
         print(f"4) Cookies file : {cfg['cookies'] or '(none)'}")
-        print(f"5) Update repo  : {cfg['update_url'] or '(not set)'}")
         print("0) Back")
         c = ask("Choose:")
         if c == "1":
@@ -973,19 +1186,6 @@ def menu_settings():
                 say("Unsupported format.", "r")
         elif c == "4":
             cfg["cookies"] = clean_path(ask("Path to cookies.txt (blank = none):"))
-        elif c == "5":
-            say("Use a repository you own or trust - the script will run "
-                "whatever code is there.", "y")
-            say("Example: https://github.com/yourname/mediadl", "c")
-            url = ask("Repo or raw-file link (blank = keep, 'off' = disable):").strip()
-            if url.lower() in ("off", "none", "-"):
-                cfg["update_url"] = ""
-            elif url:
-                cfg["update_url"] = url
-                cfg["last_update_check"] = 0
-                save_cfg()
-                check_script_update(auto=False)
-                pause()
         elif c == "0":
             break
         save_cfg()
@@ -996,16 +1196,11 @@ def menu_update():
     say("Installing yt-dlp NIGHTLY (newest YouTube fixes)...", "y")
     subprocess.call([sys.executable, "-m", "pip", "install", "-U", "--pre",
                      "yt-dlp", "yt-dlp-ejs"])
-    if find_spec("spotdl"):
-        subprocess.call([sys.executable, "-m", "pip", "install", "-U", "spotdl"])
     cfg["last_update"] = time.time()
     save_cfg()
     _flag_cache.clear()
     say("Update finished.", "g")
 
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
 MENU = [
     ("1", "Music download (YouTube / Spotify / SoundCloud)", menu_music),
     ("2", "Video download (YouTube / TikTok / Instagram)", menu_video),
@@ -1018,6 +1213,7 @@ MENU = [
     ("9", "Update tools", menu_update),
     ("10", "Check for script update", menu_script_update),
     ("11", "Check / install requirements", menu_requirements),
+    ("12", "Search & download song by name", menu_search),
 ]
 
 
@@ -1027,9 +1223,9 @@ def main():
     check_script_update(auto=True)
     while True:
         os.system("clear")
-        say("=" * 44, "c")
-        say(f"     MediaDL  -  Termux Downloader  v{__version__}", "b")
-        say("=" * 44, "c")
+        say("=" * 46, "c")
+        say(f"  MediaDL by mrk  -  Termux Downloader v{__version__}", "b")
+        say("=" * 46, "c")
         for key, label, _ in MENU:
             print(f" {key}) {label}")
         print(" 0) Exit")
