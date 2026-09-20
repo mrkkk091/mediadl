@@ -1,4 +1,4 @@
 {
-  "version": "1.0.1",
-  "changelog": " Nigga "
+  "version": "1.0.2",
+  "changelog": "New built-in Spotify downloader (no spotdl needed), search songs by name, fixed requirement checker"
 }
