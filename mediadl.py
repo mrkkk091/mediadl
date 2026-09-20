@@ -4,7 +4,9 @@ import importlib.metadata as md
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -14,7 +16,12 @@ from collections import deque
 from importlib import invalidate_caches
 from importlib.util import find_spec
 
-__version__ = "1.0.4"
+try:
+    import termios
+except ImportError:
+    termios = None
+
+__version__ = "1.0.5"
 UPDATE_REPO = "https://github.com/mrkkk091/mediadl"
 
 CONFIG_PATH = os.path.expanduser("~/.mediadl.json")
@@ -111,9 +118,43 @@ NEXT_TAG = "@@NEXT@@"
 DONE_TAG = "@@DONE@@"
 
 
-def clean_print_args(playlist):
+class SkipTrack(Exception):
+    def __init__(self, item=""):
+        super().__init__(item)
+        self.item = item
+        m = re.match(r"\[(\d+)/", item)
+        self.index = int(m.group(1)) if m else None
+
+
+def flush_stdin():
+    if termios and sys.stdin.isatty():
+        try:
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        except (OSError, ValueError, termios.error):
+            pass
+
+
+def show_skip_hint():
+    if sys.stdin.isatty():
+        say("Press ENTER at any time to skip the current song.", "y")
+
+
+def remove_partials(folder, prefix, before):
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for n in names:
+        if n.startswith(prefix) and n not in before:
+            try:
+                os.remove(os.path.join(folder, n))
+            except OSError:
+                pass
+
+
+def clean_print_args(playlist, total=None):
     if playlist:
-        item = "[%(playlist_index)s/%(n_entries)s] %(title)s"
+        item = f"[%(playlist_index)s/{total or '%(n_entries)s'}] %(title)s"
     else:
         item = "%(title)s"
     return ["--quiet", "--no-warnings", "--no-simulate",
@@ -121,22 +162,68 @@ def clean_print_args(playlist):
             "--print", f"after_move:{DONE_TAG}{item}"]
 
 
-def run_clean(cmd, seen):
+def _kill(p):
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except OSError:
+        p.terminate()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            p.kill()
+        p.wait()
+
+
+def _read_lines(p, poll):
+    fd = p.stdout.fileno()
+    buf = b""
+    while True:
+        watch = [fd, sys.stdin] if poll else [fd]
+        try:
+            ready, _, _ = select.select(watch, [], [], 0.3)
+        except (OSError, ValueError):
+            ready = [fd]
+        if poll and sys.stdin in ready:
+            if sys.stdin.readline():
+                yield None
+            else:
+                poll = False
+        if fd in ready:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                if buf:
+                    yield buf.decode("utf-8", "replace")
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                yield line.decode("utf-8", "replace")
+
+
+def run_clean(cmd, seen, skippable=False):
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, errors="replace", bufsize=1, env=env)
+                             stdin=subprocess.DEVNULL, env=env, start_new_session=True)
     except FileNotFoundError:
         say(f"Command not found: {cmd[0]}", "r")
         return False, False
+    poll = skippable and sys.stdin.isatty()
     retryable = False
+    current = ""
     try:
-        for raw in p.stdout:
+        for raw in _read_lines(p, poll):
+            if raw is None:
+                _kill(p)
+                raise SkipTrack(current)
             line = raw.strip()
             if line.startswith(NEXT_TAG):
-                item = line[len(NEXT_TAG):]
-                if item not in seen:
-                    say(f"  → Next: {item}", "c")
+                current = line[len(NEXT_TAG):]
+                if current not in seen:
+                    say(f"  → Next: {current}", "c")
             elif line.startswith(DONE_TAG):
                 item = line[len(DONE_TAG):]
                 if item not in seen:
@@ -149,7 +236,7 @@ def run_clean(cmd, seen):
                     retryable = True
         p.wait()
     except KeyboardInterrupt:
-        p.terminate()
+        _kill(p)
         raise
     return p.returncode == 0, retryable
 
@@ -162,7 +249,7 @@ CLIENT_SETS = [
 ]
 
 
-def run_yt(cmd, url, clean=False):
+def run_yt(cmd, url, clean=False, skippable=False):
     tries = CLIENT_SETS if "youtu" in url.lower() else [None]
     seen = set()
     for i, clients in enumerate(tries):
@@ -170,7 +257,7 @@ def run_yt(cmd, url, clean=False):
         if clients:
             c += ["--extractor-args", f"youtube:player_client={clients}"]
         if clean:
-            ok, retryable = run_clean(c + [url], seen)
+            ok, retryable = run_clean(c + [url], seen, skippable)
         else:
             ok, retryable = run(c + [url]), True
         if ok:
@@ -520,22 +607,44 @@ def music_ytdlp(url):
                 "--parse-metadata", "%(playlist_index)s:%(track_number)s"]
         if not is_album:
             cmd += ["--parse-metadata", "%(playlist_title)s:%(album)s"]
-        cmd += clean_print_args(playlist=True)
+        cmd += clean_print_args(playlist=True, total=count)
+        is_list = True
     else:
+        is_list = False
+        count = 0
         outdir = cfg["music_dir"]
         say(f"\nSaving to: {outdir}", "y")
         cmd += ["--no-playlist", "-P", outdir, "-o", "%(title)s.%(ext)s"]
         cmd += clean_print_args(playlist=False)
 
     before = snapshot(outdir)
-    ok = run_yt(cmd, url, clean=True)
+    if is_list:
+        show_skip_hint()
+    flush_stdin()
+    start, skipped, ok = 1, 0, False
+    while True:
+        run_cmd = cmd + (["--playlist-start", str(start)] if start > 1 else [])
+        try:
+            ok = run_yt(run_cmd, url, clean=True, skippable=is_list)
+            break
+        except SkipTrack as sk:
+            skipped += 1
+            say(f"  ↷ Skipped: {sk.item or 'this song'}", "y")
+            idx = sk.index or start
+            remove_partials(outdir, f"{idx:02d} - ", before)
+            start = idx + 1
+            if count and start > count:
+                ok = True
+                break
+    flush_stdin()
     if not ok:
         cleanup_orphans(outdir, before)
         say("Some or all tracks failed. Try menu 9 (Update tools), then retry "
             "- finished tracks are skipped automatically.", "r")
     media_scan(outdir)
     if ok:
-        say(f"Done -> {outdir}", "g")
+        note = f"  ({skipped} skipped)" if skipped else ""
+        say(f"Done -> {outdir}{note}", "g")
     return ok
 
 
@@ -789,7 +898,8 @@ def download_matched(tr, outdir, stem):
         "-x", "--audio-format", cfg["audio_format"], "--audio-quality", "0",
         "--no-mtime", "--no-playlist", "--quiet", "--no-warnings",
         "-P", outdir, "-o", f"{stem}.%(ext)s"]
-    return run_yt(cmd, f"https://www.youtube.com/watch?v={match['id']}", clean=True)
+    return run_yt(cmd, f"https://www.youtube.com/watch?v={match['id']}",
+                  clean=True, skippable=True)
 
 
 def search_and_download(query):
@@ -857,7 +967,11 @@ def music_spotify(url):
     say(f"Saving to: {outdir}", "y")
 
     cover = _image_bytes(meta["cover"]) if meta["cover"] else None
-    done = 0
+    before = snapshot(outdir)
+    done = skipped = 0
+    if total > 1:
+        show_skip_hint()
+    flush_stdin()
     for tr in tracks:
         label = f"{tr['artist']} - {tr['title']}" if tr["artist"] else tr["title"]
         prefix = "" if single else f"[{tr['n']:02d}/{total}] "
@@ -868,7 +982,14 @@ def music_spotify(url):
             done += 1
             continue
         say(f"  → Next: {prefix}{label}", "c")
-        if download_matched(tr, outdir, stem) and os.path.exists(dest):
+        try:
+            got = download_matched(tr, outdir, stem)
+        except SkipTrack:
+            remove_partials(outdir, f"{stem}.", before)
+            say(f"  ↷ Skipped: {prefix}{label}", "y")
+            skipped += 1
+            continue
+        if got and os.path.exists(dest):
             tag_audio(dest, tr["title"], tr["artist"],
                       "" if single else meta["name"],
                       meta["artist"] if kind == "album" else "",
@@ -877,9 +998,12 @@ def music_spotify(url):
             done += 1
         else:
             say(f"  ✖ Could not download: {prefix}{label}", "r")
+    flush_stdin()
     media_scan(outdir)
-    say(f"\nFinished: {done}/{total} tracks -> {outdir}", "g" if done == total else "y")
-    return done == total
+    note = f", {skipped} skipped" if skipped else ""
+    say(f"\nFinished: {done}/{total} tracks{note} -> {outdir}",
+        "g" if done + skipped == total else "y")
+    return done + skipped == total
 
 
 def music_link(url):
@@ -942,6 +1066,7 @@ def menu_search():
 def menu_music():
     say("\n== Music download ==  (YouTube, YouTube Music, Spotify, SoundCloud...)")
     say("Albums/playlists are saved in a folder named after the album.", "y")
+    say("While downloading a playlist/album, press ENTER to skip a song.", "y")
     url = ask_url()
     if url:
         music_link(url)
