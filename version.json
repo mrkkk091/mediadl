@@ -1,4 +1,4 @@
 {
-  "version": "1.0.5",
-  "changelog": "Press ENTER while downloading albums/playlists to skip the current song"
+  "version": "1.1.0",
+  "changelog": "New web interface (menu 14 or: python mediadl.py web) - all downloads from your browser, still one file"
 }
