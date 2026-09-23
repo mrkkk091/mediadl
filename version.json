@@ -1,0 +1,4 @@
+{
+  "version": "1.7.0",
+  "changelog": "Any-site video downloads now also handle DASH (.mpd) streams, alongside HLS, direct files and embedded players"
+}
