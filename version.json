@@ -1,4 +1,4 @@
 {
-  "version": "1.100000.0",
-  "changelog": "Testyttt["
+  "version": "1.9.0",
+  "changelog": "The any-site video downloader now uses your cookies.txt (Settings) too, for pages that need you to be logged in"
 }
