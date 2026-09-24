@@ -1,4 +1,4 @@
 {
-  "version": "1.8.0",
-  "changelog": "Choose which video to download when a page has more than one (galleries, preview grids) - interactive in the menu, or Find videos on this page in the web interface"
+  "version": "1.9.0",
+  "changelog": "The any-site video downloader now uses your cookies.txt (Settings) too, for pages that need you to be logged in"
 }

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import http.cookiejar
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,7 +27,7 @@ try:
 except ImportError:
     termios = None
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 UPDATE_REPO = "https://github.com/mrkkk091/mediadl"
 
 CONFIG_PATH = os.path.expanduser("~/.mediadl.json")
@@ -1271,11 +1272,61 @@ def sniff_video_urls(html, base_url):
     return candidates, embeds
 
 
+_cookiejar_cache = {"path": None, "jar": None}
+
+
+def get_cookie_jar():
+    """Load the cookies.txt file set in Settings (Netscape format), cached
+    until the path changes. Returns None if none is set or it fails to load."""
+    path = cfg.get("cookies")
+    if not path or not os.path.isfile(path):
+        return None
+    if _cookiejar_cache["path"] != path:
+        jar = http.cookiejar.MozillaCookieJar()
+        try:
+            jar.load(path, ignore_discard=True, ignore_expires=True)
+        except Exception:
+            return None
+        _cookiejar_cache["path"] = path
+        _cookiejar_cache["jar"] = jar
+    return _cookiejar_cache["jar"]
+
+
+def cookie_opener():
+    jar = get_cookie_jar()
+    if jar is None:
+        return None
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def open_url(req, timeout):
+    """Like urllib.request.urlopen, but sends the configured cookies.txt
+    (if any) for sites that need you to be logged in."""
+    opener = cookie_opener()
+    if opener:
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def cookie_header_for(url):
+    """The raw Cookie: header value for a URL, for tools (ffmpeg) that can't
+    use a cookie jar directly. Empty string if no cookies apply."""
+    jar = get_cookie_jar()
+    if jar is None:
+        return ""
+    probe = urllib.request.Request(url)
+    try:
+        jar.add_cookie_header(probe)
+    except Exception:
+        return ""
+    return probe.get_header("Cookie") or ""
+
+
 def fetch_page_html(url, referer=None):
     headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
     if referer:
         headers["Referer"] = referer
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as r:
+    with open_url(urllib.request.Request(url, headers=headers), timeout=20) as r:
         ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         final_url = r.geturl()
         if ctype and not ctype.startswith("text/html") and "xml" not in ctype:
@@ -1296,12 +1347,12 @@ def _probe_url_kind(url, referer):
         return "dash", url, {}
     headers = {"User-Agent": UA, "Referer": referer} if referer else {"User-Agent": UA}
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method="HEAD"),
-                                    timeout=15) as r:
+        with open_url(urllib.request.Request(url, headers=headers, method="HEAD"),
+                     timeout=15) as r:
             final_url, resp = r.geturl(), r.headers
     except (urllib.error.URLError, OSError, ValueError):
         try:
-            with urllib.request.urlopen(urllib.request.Request(
+            with open_url(urllib.request.Request(
                     url, headers=dict(headers, Range="bytes=0-0")), timeout=15) as r:
                 final_url, resp = r.geturl(), r.headers
         except Exception:
@@ -1333,8 +1384,8 @@ def stream_download_file(url, outdir, referer, name_hint=None):
         os.makedirs(outdir, exist_ok=True)
         dest = unique_path(os.path.join(outdir, f"{name}{ext}"))
         say("Downloading video file...", "y")
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
-                                    timeout=60) as r, open(dest, "wb") as f:
+        with open_url(urllib.request.Request(url, headers=headers),
+                     timeout=60) as r, open(dest, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             done = last = 0
             while True:
@@ -1380,7 +1431,9 @@ def hls_download(m3u8_url, outdir, referer, name_hint=None):
         return False
     os.makedirs(outdir, exist_ok=True)
     dest = unique_path(os.path.join(outdir, f"{clean(name_hint) or 'video'}.mp4"))
-    header_str = f"User-Agent: {UA}\r\n" + (f"Referer: {referer}\r\n" if referer else "")
+    cookie = cookie_header_for(m3u8_url)
+    header_str = (f"User-Agent: {UA}\r\n" + (f"Referer: {referer}\r\n" if referer else "")
+                 + (f"Cookie: {cookie}\r\n" if cookie else ""))
     say("Downloading video stream...", "y")
     set_progress(None)
     base_cmd = ["ffmpeg", "-y", "-loglevel", "error", "-headers", header_str, "-i", m3u8_url]
@@ -1413,7 +1466,9 @@ def dash_download(mpd_url, outdir, referer, name_hint=None):
         return False
     os.makedirs(outdir, exist_ok=True)
     dest = unique_path(os.path.join(outdir, f"{clean(name_hint) or 'video'}.mp4"))
-    header_str = f"User-Agent: {UA}\r\n" + (f"Referer: {referer}\r\n" if referer else "")
+    cookie = cookie_header_for(mpd_url)
+    header_str = (f"User-Agent: {UA}\r\n" + (f"Referer: {referer}\r\n" if referer else "")
+                 + (f"Cookie: {cookie}\r\n" if cookie else ""))
     say("Downloading video stream...", "y")
     set_progress(None)
     base_cmd = ["ffmpeg", "-y", "-loglevel", "error", "-headers", header_str, "-i", mpd_url]
@@ -1653,8 +1708,16 @@ def download_video(url, height=None, _depth=0, interactive=False):
         else:
             ok = generic_any_site_download(url, outdir, height, _depth=_depth)
         if not ok:
-            say("Could not find a downloadable video on that page. Some sites "
-                "block automated downloads or need you to be logged in.", "y")
+            if cfg.get("cookies"):
+                say("Could not find a downloadable video on that page, even "
+                    "with your cookies.txt file. The site may block automated "
+                    "downloads entirely, or the video may need JavaScript to "
+                    "appear.", "y")
+            else:
+                say("Could not find a downloadable video on that page. If it "
+                    "needs you to be logged in, export a cookies.txt from your "
+                    "browser and set it in Settings (option 8 -> 4), then try "
+                    "again.", "y")
     media_scan(outdir)
     if ok:
         say(f"Done -> {outdir}", "g")
